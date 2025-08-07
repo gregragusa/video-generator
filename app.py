@@ -1,4 +1,4 @@
-```python
+
 import os
 import streamlit as st
 from pydub import AudioSegment
@@ -114,4 +114,4 @@ if st.button("🚀 Genera contenuti") and title and script:
     if os.path.exists(zip_path):
         with open(zip_path, "rb") as f:
             st.download_button("🖼️ Scarica ZIP Immagini", f, file_name="output.zip", mime="application/zip")
-```
+

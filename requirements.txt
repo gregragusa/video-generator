@@ -1,0 +1,6 @@
+openai
+pyyaml
+requests
+replicate
+streamlit>=1.0
+streamlit>=1.0

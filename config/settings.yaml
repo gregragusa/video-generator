@@ -1,0 +1,8 @@
+openai_api_key: sk-proj-b7uJFHMAUhTJI-cNIj-4BMEbMcb8jgmkjxfyATRqnXWWp0F-rHOEFvosmcsmXZRgVoS-j0j9u9T3BlbkFJTv0HnHblCMU38SKyGfhQut2YkpjhOI-bRDvGvGRM-a74zwMyr7HAy1qPutAb8p2YkpjhOI-bRDvGvGRM-a74zwMyr7HAy1qPutAb8p7JWjZNvOSX0A
+replicate_api_token: r8_1EA9QNI6gUC3PJebJnCu3dfahidohxH0n8zC7
+image_model: black-forest-labs/flux-schnell
+
+fishaudio_api_key: d8f34d355b9b47da91a66f18d37598c0
+fishaudio_model: speech-1.6
+fishaudio_voice: c9b2a95ce3b044e3990bbf6a0fb43412
+

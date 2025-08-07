@@ -1,3 +1,6 @@
+import audioop
+import sys
+sys.modules['pyaudioop'] = audioop
 
 import os
 import streamlit as st
@@ -45,10 +48,10 @@ def zip_images(base_dir: str) -> str:
 st.set_page_config(page_title="Generatore Video", layout="centered")
 st.title("🎬 Generatore di Video con Immagini e Audio")
 
-# Carica configurazione (API keys lette da variabili d'ambiente)
+# Carica configurazione (API keys da variabili di ambiente o config file)
 cfg = load_config()
 
-# Override API keys dalla UI
+# Override chiavi API dalla UI
 custom_fish = st.text_input("FishAudio API Key (lascia vuoto per default)", type="password")
 if custom_fish:
     cfg["fishaudio_api_key"] = custom_fish
@@ -86,7 +89,7 @@ if st.button("🚀 Genera contenuti") and title and script:
 
     st.subheader("🔄 Generazione in corso…")
 
-    # Audio\    
+    # Audio
     if mode in ["Audio", "Entrambi"]:
         st.text("🎧 Generazione audio…")
         aud_chunks = chunk_by_sentence(script, 2000)

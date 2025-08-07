@@ -1,8 +1,8 @@
 streamlit
 pydub
 pyyaml
+pyaudio
 openai
-pyyaml
 requests
 replicate
 streamlit>=1.0

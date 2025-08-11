@@ -1,13 +1,7 @@
 # app.py
 # -------------------------------------------------------
-# Streamlit app che chiede le API e i parametri (modello/voce)
-# e genera IMMAGINI / AUDIO usando scripts/utils.py.
-# - Insert API dal sito (sessione), niente secrets obbligatori
-# - FishAudio: Voice ID
-# - Replicate: modello preset o custom
-# - IMMAGINI: per "Solo Immagini" → 1 immagine ogni N frasi
-# - AUDIO / ENTRAMBI: immagini ogni X secondi di audio
-# - Verifica token Replicate dalla sidebar
+# Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
+# Niente pydub (incompatibile con Python 3.13): usiamo mutagen + ffmpeg.
 # -------------------------------------------------------
 
 import os
@@ -15,7 +9,6 @@ import re
 import time
 import requests
 import streamlit as st
-from pydub import AudioSegment
 
 # se hai questo loader lo usiamo, altrimenti proseguiamo senza
 try:
@@ -28,6 +21,7 @@ from scripts.utils import (
     chunk_by_sentences_count,
     generate_audio,
     generate_images,
+    mp3_duration_seconds,  # nuova util per leggere durata MP3
 )
 
 # ---------------------------
@@ -285,17 +279,16 @@ if generate and title.strip() and script.strip():
             st.error("❌ Modello Replicate mancante. Seleziona un preset o inserisci un Custom model.")
         else:
             if mode == "Entrambi":
-                # serve l'audio per calcolare le immagini in base ai secondi
+                # serve l'audio per calcolare le immagini in base ai secondi (usiamo mutagen)
                 if not os.path.exists(audio_path):
                     st.error("❌ Audio non trovato per calcolare le immagini. Genera prima l’audio.")
                 else:
                     st.text(f"🖼️ Generazione immagini con modello: {get_replicate_model()} (tempo audio)…")
                     try:
-                        audio = AudioSegment.from_file(audio_path)
-                        duration_sec = len(audio) / 1000
+                        duration_sec = mp3_duration_seconds(audio_path)
                     except Exception:
                         duration_sec = 0
-                    if duration_sec == 0:
+                    if not duration_sec:
                         duration_sec = 60  # fallback
                     num_images = max(1, int(duration_sec // seconds_per_img))
                     approx_chars = max(1, len(script) // max(1, num_images))

@@ -1,21 +1,19 @@
 # scripts/utils.py
 # -------------------------------------------------------
-# Utility per chunking + generazione IMMAGINI (Replicate) e AUDIO (FishAudio)
-# con gestione errori, normalizzazione output e logging "amichevole".
+# Utility: chunking testo + IMMAGINI (Replicate) + AUDIO (FishAudio)
+# Niente pydub: usiamo mutagen (durate) e imageio-ffmpeg per concatenare.
 # -------------------------------------------------------
 
 import os
 import re
 import time
+import subprocess
 from io import BytesIO
 
 import requests
 from PIL import Image
-from pydub import AudioSegment
 
-# ===========================
-# Chunking helpers
-# ===========================
+# ============== Chunking ==============
 def chunk_text(text: str, max_chars: int):
     """Divide text in blocchi di max_chars, spezzando tra le parole."""
     words = (text or "").split()
@@ -55,55 +53,40 @@ def chunk_by_sentences_count(text: str, sentences_per_chunk: int):
     N = max(1, int(sentences_per_chunk or 1))
     return [" ".join(sentences[i:i + N]) for i in range(0, len(sentences), N)]
 
-
-# ===========================
-# Helpers vari
-# ===========================
+# ============== Streamlit helper ==============
 def _st():
-    """Ritorna streamlit se disponibile, altrimenti None."""
     try:
         import streamlit as st  # type: ignore
         return st
     except Exception:
         return None
 
-
+# ============== Immagini ==============
 def save_image_from_url(url: str, path: str, timeout: int = 30):
-    """Scarica immagine da URL e salva su disco (converte in PNG se serve)."""
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
+    from PIL import Image
     img = Image.open(BytesIO(r.content))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if img.mode in ("P", "RGBA"):
         img = img.convert("RGB")
     img.save(path)
 
-
 def _download_first(urls, dest_path: str):
-    """Salva la prima URL valida da una lista in dest_path."""
     if not urls:
         raise ValueError("Nessuna URL immagine restituita dal modello.")
     save_image_from_url(urls[0], dest_path)
     return dest_path
 
-
-# ===========================
-# IMMAGINI (Replicate)
-# ===========================
-def generate_images(
-    chunks,
-    cfg: dict,
-    outdir: str,
-    sleep_between_calls: float = 11.0,  # anti rate-limit
-):
+def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float = 11.0):
     """
     Genera 1 immagine per ogni elemento di `chunks` usando Replicate.
 
     Config letta da:
       - API: cfg['replicate_api_token'] | cfg['replicate_api_key'] | env REPLICATE_API_TOKEN
-      - Modello: cfg['image_model'] | cfg['replicate_model'] (es. 'owner/name:tag')
-      - Extra input: cfg['replicate_input'] (dict) opzionale (width/height/steps/guidance...)
-      - aspect_ratio default da cfg['aspect_ratio'] o '16:9'
+      - Modello: cfg['image_model'] | cfg['replicate_model']
+      - Extra input: cfg['replicate_input'] (dict, opzionale)
+      - aspect_ratio default: cfg['aspect_ratio'] o '16:9'
     """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
@@ -121,11 +104,10 @@ def generate_images(
         if st: st.error("❌ " + msg)
         raise ValueError(msg)
     if not model:
-        msg = "Modello Replicate assente. Imposta 'image_model' o 'replicate_model' in cfg (es. 'owner/name:tag')."
+        msg = "Modello Replicate assente. Imposta 'image_model' o 'replicate_model' (es. 'owner/name:tag')."
         if st: st.error("❌ " + msg)
         raise ValueError(msg)
 
-    # Import qui per evitare dipendenza se non serve
     import replicate
     client = replicate.Client(api_token=api_key)
 
@@ -138,7 +120,6 @@ def generate_images(
         print(f"[INFO] Using Replicate model: {model}")
 
     results = []
-
     for idx, prompt in enumerate(chunks, start=1):
         model_input = {"prompt": prompt}
         model_input.setdefault("aspect_ratio", (cfg or {}).get("aspect_ratio", "16:9"))
@@ -148,7 +129,6 @@ def generate_images(
         try:
             output = client.run(model, input=model_input)
 
-            # Normalizza output in lista di URL
             urls = []
             if isinstance(output, str):
                 urls = [output]
@@ -172,17 +152,11 @@ def generate_images(
                 print(f"[OK] Saved {outpath}")
 
         except Exception as e:
-            # Identifica ReplicateError se disponibile
             try:
                 ReplicateError = replicate.exceptions.ReplicateError
             except Exception:
                 ReplicateError = Exception
-
-            if isinstance(e, ReplicateError):
-                msg = f"ReplicateError su chunk {idx}: {e}"
-            else:
-                msg = f"Errore su chunk {idx}: {e}"
-
+            msg = f"ReplicateError su chunk {idx}: {e}" if isinstance(e, ReplicateError) else f"Errore su chunk {idx}: {e}"
             if st: st.error("❌ " + msg)
             else: print("[ERROR]", msg)
             raise
@@ -192,10 +166,60 @@ def generate_images(
 
     return results
 
+# ============== Audio (FishAudio) senza pydub ==============
 
-# ===========================
-# AUDIO (FishAudio)
-# ===========================
+# Durata MP3
+def mp3_duration_seconds(path: str) -> float:
+    """Ritorna la durata in secondi usando mutagen."""
+    try:
+        from mutagen.mp3 import MP3
+        return float(MP3(path).info.length)
+    except Exception:
+        # fallback: 0 se non disponibile
+        return 0.0
+
+# Concatenazione MP3 con ffmpeg (portabile via imageio-ffmpeg)
+def concat_mp3s(paths, out_path: str, bitrate_kbps: int = 128):
+    """
+    Concatena MP3 usando ffmpeg. Per robustezza, ricodifichiamo a libmp3lame.
+    """
+    if not paths:
+        raise RuntimeError("Nessun file MP3 da concatenare.")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # prepara file di lista per concat demuxer
+    list_path = out_path + ".txt"
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in paths:
+            abspath = os.path.abspath(p)
+            f.write(f"file '{abspath}'\n")
+
+    # trova ffmpeg portabile
+    try:
+        import imageio_ffmpeg
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_bin = "ffmpeg"  # prova sistema
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_path,
+        "-c:a", "libmp3lame",
+        "-b:a", f"{bitrate_kbps}k",
+        out_path,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg concat failed: {proc.stderr.decode(errors='ignore')[:500]}")
+
+    try:
+        os.remove(list_path)
+    except Exception:
+        pass
+
 def _download_with_retry(url: str, retries: int = 3, timeout: int = 30) -> bytes:
     last_exc = None
     for _ in range(max(1, retries)):
@@ -208,28 +232,23 @@ def _download_with_retry(url: str, retries: int = 3, timeout: int = 30) -> bytes
             time.sleep(1.5)
     raise last_exc or RuntimeError("Download fallito")
 
-
-def generate_audio(
-    chunks,
-    cfg: dict,
-    outdir: str,
-    tts_endpoint: str = "https://api.fish.audio/v1/tts",
-):
+def generate_audio(chunks, cfg: dict, outdir: str,
+                   tts_endpoint: str = "https://api.fish.audio/v1/tts"):
     """
     Genera audio da ogni blocco di testo in `chunks` con FishAudio e li concatena.
 
-    Config usata:
-      - cfg['fishaudio_api_key']          (obbligatoria)
-      - cfg['fishaudio_voice'] | cfg['fishaudio_voice_id']  (obbligatoria)
-      - cfg['fishaudio_model']            (opzionale: se presente la inviamo)
-      - opzionale: cfg['fishaudio_extra'] (dict) per altri campi (format, bitrate, ecc.)
+    Config:
+      - cfg['fishaudio_api_key']               (obbligatoria)
+      - cfg['fishaudio_voice'] | cfg['fishaudio_voice_id']   (obbligatoria)
+      - cfg['fishaudio_model']                 (opzionale; se c'è la inviamo)
+      - cfg['fishaudio_extra']                 (dict opzionale; es. format/bitrate)
     """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
 
     api_key = (cfg or {}).get("fishaudio_api_key")
     voice_id = (cfg or {}).get("fishaudio_voice") or (cfg or {}).get("fishaudio_voice_id")
-    model = (cfg or {}).get("fishaudio_model")  # opzionale
+    model = (cfg or {}).get("fishaudio_model")
     extra = (cfg or {}).get("fishaudio_extra", {})
 
     if not api_key:
@@ -245,9 +264,8 @@ def generate_audio(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    # compat: se vuoi inviarlo in header come nel tuo codice originale
     if model:
-        headers["model"] = model
+        headers["model"] = model  # compat con tuo codice precedente
 
     audio_paths = []
     for i, text in enumerate(chunks, 1):
@@ -259,7 +277,6 @@ def generate_audio(
         payload = {
             "text": text,
             "reference_id": voice_id,
-            # default comuni
             "format": "mp3",
             "mp3_bitrate": 128,
         }
@@ -272,9 +289,8 @@ def generate_audio(
             resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=90)
             resp.raise_for_status()
 
-            # Alcune API restituiscono JSON con 'audio_url'; altre restituiscono binario
-            content_type = resp.headers.get("Content-Type", "")
-            if "application/json" in content_type:
+            ct = resp.headers.get("Content-Type", "")
+            if "application/json" in ct:
                 data = resp.json()
                 audio_url = data.get("audio_url") or data.get("url")
                 if not audio_url:
@@ -287,11 +303,11 @@ def generate_audio(
             with open(path, "wb") as f:
                 f.write(audio_bytes)
 
-            seg = AudioSegment.from_file(path)
+            dur_ms = int(mp3_duration_seconds(path) * 1000)
             if st:
-                st.write(f"✅ TTS chunk {i:02d} durata: {len(seg)} ms")
+                st.write(f"✅ TTS chunk {i:02d} durata: {dur_ms} ms")
             else:
-                print(f"[TTS] chunk {i:02d} duration: {len(seg)} ms — ✅")
+                print(f"[TTS] chunk {i:02d} duration: {dur_ms} ms — ✅")
 
             audio_paths.append(path)
 
@@ -304,21 +320,15 @@ def generate_audio(
     if not audio_paths:
         raise RuntimeError("Nessun audio generato.")
 
-    combined = AudioSegment.empty()
-    for p in audio_paths:
-        combined += AudioSegment.from_mp3(p)
-
-    if st:
-        st.write(f"🔊 Durata totale audio: {len(combined)} ms")
-    else:
-        print(f"[TTS] combined duration: {len(combined)} ms")
-
     out_path = os.path.join(outdir, "combined_audio.mp3")
-    combined.export(out_path, format="mp3")
+    concat_mp3s(audio_paths, out_path, bitrate_kbps=128)
 
+    total_ms = int(mp3_duration_seconds(out_path) * 1000)
     if st:
+        st.write(f"🔊 Durata totale audio: {total_ms} ms")
         st.success("🔊 Audio finale creato.")
     else:
+        print(f"[TTS] combined duration: {total_ms} ms")
         print("🔊 Audio finale creato.")
 
     return out_path

@@ -1,12 +1,16 @@
 # app.py
 # -------------------------------------------------------
 # Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
-# Niente pydub (incompatibile con Python 3.13): usiamo mutagen + ffmpeg.
+# Niente pydub: usiamo durata MP3 via scripts.utils.mp3_duration_seconds (mutagen)
+# + concat MP3 con ffmpeg se generiamo chunk audio lunghi.
+# Inoltre: generazione IMMAGINI in batch con retry e progress bar.
 # -------------------------------------------------------
 
 import os
 import re
 import time
+import glob
+import subprocess
 import requests
 import streamlit as st
 
@@ -21,7 +25,7 @@ from scripts.utils import (
     chunk_by_sentences_count,
     generate_audio,
     generate_images,
-    mp3_duration_seconds,  # nuova util per leggere durata MP3
+    mp3_duration_seconds,  # legge durata MP3 senza caricarlo in RAM
 )
 
 # ---------------------------
@@ -54,6 +58,27 @@ def _clean_token(tok: str) -> str:
 def _mask(tok: str) -> str:
     t = (tok or "").strip()
     return t[:3] + "…" + t[-4:] if len(t) > 8 else "—"
+
+def ffmpeg_concat_mp3(aud_dir: str, out_path: str) -> bool:
+    """Se troviamo part_*.mp3 li concateniamo senza ricodifica."""
+    parts = sorted(glob.glob(os.path.join(aud_dir, "part_*.mp3")))
+    if not parts:
+        return False
+    list_path = os.path.join(aud_dir, "concat_list.txt")
+    with open(list_path, "w") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_path, "-c", "copy", out_path
+    ]
+    try:
+        res = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return os.path.exists(out_path)
+    except Exception as e:
+        # Mostra un messaggio non bloccante
+        st.warning(f"ffmpeg concat fallita: {e}")
+        return False
 
 # ---------------------------
 # Pagina
@@ -203,7 +228,7 @@ mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
 if mode in ["Audio", "Entrambi"]:
     seconds_per_img = st.number_input(
         "Ogni quanti secondi di audio creare un'immagine?",
-        min_value=1, value=8, step=1
+        min_value=1, value=30, step=1  # default 30s per la tua richiesta
     )
 else:  # Solo Immagini
     sentences_per_image = st.number_input(
@@ -268,8 +293,20 @@ if generate and title.strip() and script.strip():
             st.error("❌ FishAudio Voice ID mancante. Inseriscilo nella sidebar.")
         else:
             st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
-            aud_chunks = chunk_text(script, 30000)  # adatta al tuo TTS se serve
+            # Chunk più piccoli per evitare timeout su audio lunghi
+            # (se il tuo TTS consente 30k caratteri puoi rialzare)
+            aud_chunks = chunk_text(script, 8000)
+            # La tua funzione genera i file. Idealmente: part_0001.mp3, part_0002.mp3, ...
             generate_audio(aud_chunks, runtime_cfg, aud_dir)
+
+            # Se non esiste il file combinato, proviamo a concatenare eventuali part_*.mp3
+            if not os.path.exists(audio_path):
+                concatenated = ffmpeg_concat_mp3(aud_dir, audio_path)
+                if concatenated:
+                    st.success("🔗 Audio concatenato con ffmpeg.")
+                else:
+                    # come fallback resterà duration=0 e gestiremo sotto
+                    st.warning("⚠️ Non ho trovato file da concatenare. Assicurati che generate_audio produca part_*.mp3 o combined_audio.mp3.")
 
     # ---- IMMAGINI ----
     if mode in ["Immagini", "Entrambi"]:
@@ -279,29 +316,77 @@ if generate and title.strip() and script.strip():
             st.error("❌ Modello Replicate mancante. Seleziona un preset o inserisci un Custom model.")
         else:
             if mode == "Entrambi":
-                # serve l'audio per calcolare le immagini in base ai secondi (usiamo mutagen)
+                # serve l'audio per calcolare le immagini in base ai secondi
                 if not os.path.exists(audio_path):
-                    st.error("❌ Audio non trovato per calcolare le immagini. Genera prima l’audio.")
+                    # se ci sono part_*.mp3, prova a concatenare adesso
+                    if ffmpeg_concat_mp3(aud_dir, audio_path):
+                        st.info("🔗 Ho creato l'audio combinato ora per calcolare la durata.")
+                if not os.path.exists(audio_path):
+                    st.error("❌ Audio non trovato per calcolare il numero di immagini. Genera prima l’audio.")
                 else:
-                    st.text(f"🖼️ Generazione immagini con modello: {get_replicate_model()} (tempo audio)…")
+                    st.text(f"🖼️ Generazione immagini con modello: {get_replicate_model()} (in base alla durata audio)…")
                     try:
                         duration_sec = mp3_duration_seconds(audio_path)
                     except Exception:
                         duration_sec = 0
                     if not duration_sec:
-                        duration_sec = 60  # fallback
-                    num_images = max(1, int(duration_sec // seconds_per_img))
-                    approx_chars = max(1, len(script) // max(1, num_images))
-                    img_chunks = chunk_text(script, approx_chars)
-                    st.text(f"🖼️ Generazione di {len(img_chunks)} immagini…")
-                    generate_images(img_chunks, runtime_cfg, img_dir)
+                        # fallback prudente
+                        duration_sec = 60.0
+
+                    # Numero immagini senza limiti (es: 3h / 30s = 360 immagini)
+                    num_images = max(1, int(round(duration_sec / float(seconds_per_img))))
+
+                    # Spezzetta lo script in blocchi testuali bilanciati
+                    approx_chars = max(50, len(script) // max(1, num_images))
+                    chunks = chunk_text(script, approx_chars)
+
+                    st.text(f"🖼️ Devo generare {len(chunks)} immagini totali…")
+                    # Batch + retry + progress
+                    batch_size = 8  # invia 8 alla volta per non saturare l'API
+                    total = len(chunks)
+                    done = 0
+                    prog = st.progress(0.0)
+
+                    for i in range(0, total, batch_size):
+                        batch = chunks[i:i+batch_size]
+                        for attempt in range(3):
+                            try:
+                                generate_images(batch, runtime_cfg, img_dir)
+                                break
+                            except Exception as e:
+                                if attempt == 2:
+                                    st.error(f"Errore batch {i//batch_size+1}: {e}")
+                                time.sleep(2 + attempt * 3)  # piccoli backoff
+                        done += len(batch)
+                        prog.progress(min(1.0, done/total))
+                        time.sleep(0.2)
+
                     zip_images(base)
             else:
-                # SOLO IMMAGINI → raggruppo per frasi
+                # SOLO IMMAGINI → raggruppo per frasi e faccio batch + progress
                 st.text(f"🖼️ Generazione immagini con modello: {get_replicate_model()} (per frasi)…")
                 groups = chunk_by_sentences_count(script, int(sentences_per_image))
-                st.text(f"🖼️ Generazione di {len(groups)} immagini (1 ogni {int(sentences_per_image)} frasi)…")
-                generate_images(groups, runtime_cfg, img_dir)
+                st.text(f"🖼️ Devo generare {len(groups)} immagini (1 ogni {int(sentences_per_image)} frasi)…")
+
+                batch_size = 8
+                total = len(groups)
+                done = 0
+                prog = st.progress(0.0)
+
+                for i in range(0, total, batch_size):
+                    batch = groups[i:i+batch_size]
+                    for attempt in range(3):
+                        try:
+                            generate_images(batch, runtime_cfg, img_dir)
+                            break
+                        except Exception as e:
+                            if attempt == 2:
+                                st.error(f"Errore batch {i//batch_size+1}: {e}")
+                            time.sleep(2 + attempt * 3)
+                    done += len(batch)
+                    prog.progress(min(1.0, done/total))
+                    time.sleep(0.2)
+
                 zip_images(base)
 
     st.success("✅ Generazione completata!")

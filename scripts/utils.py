@@ -1,14 +1,17 @@
 # scripts/utils.py
 # -------------------------------------------------------
 # Utility: chunking testo + IMMAGINI (Replicate) + AUDIO (FishAudio)
-# Niente pydub: usiamo mutagen (durate) e imageio-ffmpeg per concatenare.
+# Niente pydub: usiamo mutagen (durate) e ffmpeg (via imageio-ffmpeg) per concatenare.
+# Con ritocchi "a prova di blocco": retry/backoff, resume, skip chunk già generati.
 # -------------------------------------------------------
 
 import os
 import re
 import time
+import glob
 import subprocess
 from io import BytesIO
+from typing import List
 
 import requests
 from PIL import Image
@@ -65,7 +68,6 @@ def _st():
 def save_image_from_url(url: str, path: str, timeout: int = 30):
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
-    from PIL import Image
     img = Image.open(BytesIO(r.content))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if img.mode in ("P", "RGBA"):
@@ -179,10 +181,11 @@ def mp3_duration_seconds(path: str) -> float:
         return 0.0
 
 # Concatenazione MP3 con ffmpeg (portabile via imageio-ffmpeg)
-def concat_mp3s(paths, out_path: str, bitrate_kbps: int = 128):
+def concat_mp3s(paths: List[str], out_path: str, bitrate_kbps: int = 128):
     """
     Concatena MP3 usando ffmpeg. Per robustezza, ricodifichiamo a libmp3lame.
     """
+    paths = [p for p in paths if p and os.path.exists(p)]
     if not paths:
         raise RuntimeError("Nessun file MP3 da concatenare.")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -220,20 +223,32 @@ def concat_mp3s(paths, out_path: str, bitrate_kbps: int = 128):
     except Exception:
         pass
 
-def _download_with_retry(url: str, retries: int = 3, timeout: int = 30) -> bytes:
+def _download_with_retry(url: str, retries: int = 3, timeout: int = 60) -> bytes:
     last_exc = None
-    for _ in range(max(1, retries)):
+    for attempt in range(max(1, retries)):
         try:
             r = requests.get(url, timeout=timeout)
             r.raise_for_status()
             return r.content
         except Exception as e:
             last_exc = e
-            time.sleep(1.5)
+            # backoff con jitter
+            time.sleep(1.5 + attempt * 1.0)
     raise last_exc or RuntimeError("Download fallito")
 
-def generate_audio(chunks, cfg: dict, outdir: str,
-                   tts_endpoint: str = "https://api.fish.audio/v1/tts"):
+def _pad_width(n: int) -> int:
+    """Larghezza zero-pad in base al numero di chunk (99->2, 1000->4, ecc.)."""
+    return max(2, len(str(max(1, n))))
+
+def generate_audio(
+    chunks: List[str],
+    cfg: dict,
+    outdir: str,
+    tts_endpoint: str = "https://api.fish.audio/v1/tts",
+    retries_per_chunk: int = 4,
+    base_backoff: float = 2.0,
+    sleep_between_chunks: float = 1.2,
+):
     """
     Genera audio da ogni blocco di testo in `chunks` con FishAudio e li concatena.
 
@@ -264,11 +279,22 @@ def generate_audio(chunks, cfg: dict, outdir: str,
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    if model:
-        headers["model"] = model  # compat con tuo codice precedente
 
-    audio_paths = []
+    session = requests.Session()  # connessioni riutilizzate
+
+    pad = _pad_width(len(chunks))
+    audio_paths: List[str] = []
+
     for i, text in enumerate(chunks, 1):
+        # path del pezzo corrente (resume/skip)
+        part_path = os.path.join(outdir, f"audio_{i:0{pad}d}.mp3")
+
+        # se esiste e ha durata > 0.5s, salta (resume automatico)
+        if os.path.exists(part_path) and mp3_duration_seconds(part_path) > 0.5:
+            if st: st.write(f"⏭️ Skip chunk {i} (già presente)")
+            audio_paths.append(part_path)
+            continue
+
         if st:
             st.write(f"🎧 Audio {i}/{len(chunks)}…")
         else:
@@ -285,43 +311,76 @@ def generate_audio(chunks, cfg: dict, outdir: str,
         if isinstance(extra, dict):
             payload.update(extra)
 
-        try:
-            resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=90)
-            resp.raise_for_status()
+        success = False
+        last_err = None
 
-            ct = resp.headers.get("Content-Type", "")
-            if "application/json" in ct:
-                data = resp.json()
-                audio_url = data.get("audio_url") or data.get("url")
-                if not audio_url:
-                    raise RuntimeError(f"Risposta JSON inattesa: {data}")
-                audio_bytes = _download_with_retry(audio_url, retries=3, timeout=60)
-            else:
-                audio_bytes = resp.content
+        for attempt in range(retries_per_chunk):
+            try:
+                resp = session.post(tts_endpoint, headers=headers, json=payload, timeout=90)
+                # Gestione status non 2xx
+                if resp.status_code == 413:
+                    raise RuntimeError("Payload troppo grande (413). Riduci i chunk (es. 3000 caratteri).")
+                if resp.status_code in (429, 502, 503, 504):
+                    raise RuntimeError(f"Rate limit/temporaneo ({resp.status_code}).")
+                resp.raise_for_status()
 
-            path = os.path.join(outdir, f"audio_{i:02d}.mp3")
-            with open(path, "wb") as f:
-                f.write(audio_bytes)
+                ct = resp.headers.get("Content-Type", "")
+                if "application/json" in ct:
+                    data = resp.json()
+                    audio_url = data.get("audio_url") or data.get("url")
+                    if not audio_url:
+                        raise RuntimeError(f"Risposta JSON inattesa: {str(data)[:200]}")
+                    audio_bytes = _download_with_retry(audio_url, retries=3, timeout=60)
+                else:
+                    audio_bytes = resp.content
 
-            dur_ms = int(mp3_duration_seconds(path) * 1000)
+                # salva su disco
+                with open(part_path, "wb") as f:
+                    f.write(audio_bytes)
+
+                # verifica durata > 0
+                dur_s = mp3_duration_seconds(part_path)
+                if dur_s <= 0.5:
+                    raise RuntimeError("File MP3 generato ma con durata nulla (possibile errore).")
+
+                if st:
+                    st.write(f"✅ TTS chunk {i:0{pad}d} — durata: {int(dur_s*1000)} ms")
+                else:
+                    print(f"[OK {i}] {int(dur_s*1000)} ms")
+
+                success = True
+                break
+
+            except Exception as e:
+                last_err = e
+                # backoff progressivo con un po’ di jitter
+                sleep_s = base_backoff * (attempt + 1) + (0.3 * attempt)
+                if st:
+                    st.warning(f"⚠️ Retry {attempt+1}/{retries_per_chunk} per chunk {i}: {e} (sleep {sleep_s:.1f}s)")
+                time.sleep(sleep_s)
+
+        if not success:
+            # se fallisce, NON blocchiamo tutto: passiamo al prossimo
             if st:
-                st.write(f"✅ TTS chunk {i:02d} durata: {dur_ms} ms")
+                st.error(f"❌ Fallito chunk {i}: {last_err}")
             else:
-                print(f"[TTS] chunk {i:02d} duration: {dur_ms} ms — ✅")
+                print(f"[FAIL {i}] {last_err}")
+        else:
+            audio_paths.append(part_path)
 
-            audio_paths.append(path)
+        # piccola pausa tra i chunk per non saturare l'API
+        time.sleep(sleep_between_chunks)
 
-        except Exception as e:
-            msg = f"Errore TTS sul chunk {i}: {e}"
-            if st: st.error("❌ " + msg)
-            else: print("❌", msg)
-            # continua col chunk successivo
-
+    # Se non abbiamo generato nulla, errore
+    audio_paths = [p for p in audio_paths if os.path.exists(p)]
     if not audio_paths:
-        raise RuntimeError("Nessun audio generato.")
+        raise RuntimeError("Nessun audio generato. (Controlla API key/voice ID e dimensione chunk).")
 
+    # Concatena TUTTI i pezzi trovati (anche se qualcuno è saltato)
     out_path = os.path.join(outdir, "combined_audio.mp3")
-    concat_mp3s(audio_paths, out_path, bitrate_kbps=128)
+    # ordina per numero
+    audio_paths_sorted = sorted(audio_paths)
+    concat_mp3s(audio_paths_sorted, out_path, bitrate_kbps=128)
 
     total_ms = int(mp3_duration_seconds(out_path) * 1000)
     if st:

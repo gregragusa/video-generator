@@ -1,8 +1,8 @@
 # app.py
 # -------------------------------------------------------
-# 2 step reali (Streamlit-friendly):
-# 1) AUDIO (a passate, resume) → download SUBITO
-# 2) Start images (a passate, resume, 1 per volta con retry 429)
+# UI "come prima" (un solo bottone). Supporta resume:
+# - AUDIO: part_XXXX.mp3 + combined_audio.mp3 (riprende dai pezzi mancanti)
+# - IMMAGINI: img_XXX.png (riprende dalle mancanti), 1 per volta con gestione 429
 # -------------------------------------------------------
 
 import os
@@ -12,8 +12,9 @@ import glob
 import requests
 import streamlit as st
 
+# opzionale
 try:
-    from scripts.config_loader import load_config  # opzionale
+    from scripts.config_loader import load_config
 except Exception:
     load_config = None
 
@@ -61,7 +62,7 @@ def _mask(tok: str) -> str:
 st.set_page_config(page_title="Generatore Video", page_icon="🎬", layout="centered")
 st.title("🎬 Generatore di Video con Immagini e Audio")
 
-# Config opzionale
+# Carica config opzionale
 base_cfg = {}
 if load_config:
     try:
@@ -72,7 +73,7 @@ if load_config:
         base_cfg = {}
 
 # ===========================
-# 🔐 & ⚙️ Sidebar: API + Parametri
+# 🔐 Sidebar: API + Parametri
 # ===========================
 with st.sidebar:
     st.header("🔐 API Keys")
@@ -139,8 +140,8 @@ with st.sidebar:
 
     # Modello Replicate (preset + custom)
     model_presets = [
-        "black-forest-labs/flux-schnell",
-        "black-forest-labs/flux-1.1",
+        "black-forest-labs/flux-1.1",        # più stabile sui limiti
+        "black-forest-labs/flux-schnell",    # più veloce ma spesso 429
         "stability-ai/sdxl",
         "scenario/anything-v4.5",
         "Custom (digita sotto)",
@@ -182,6 +183,7 @@ def get_fishaudio_voice_id() -> str:
 def get_replicate_model() -> str:
     return (st.session_state.get("replicate_model", "")).strip()
 
+# Badge di stato
 rep_ok = bool(get_replicate_key())
 fish_ok = bool(get_fishaudio_key())
 rep_model = get_replicate_model() or "—"
@@ -196,36 +198,24 @@ st.write(
 # ===========================
 title = st.text_input("Titolo del video")
 script = st.text_area("Inserisci il testo da usare per generare immagini/audio", height=300)
+mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
 
-# Audio: quanti chunk in questa passata (Streamlit Cloud friendly)
-audio_parts_this_run = st.number_input(
-    "Quanti chunk audio generare in questa passata?",
-    min_value=1, value=12, step=1
-)
+# Input condizionali
+if mode in ["Audio", "Entrambi"]:
+    seconds_per_img = st.number_input(
+        "Ogni quanti secondi di audio creare un'immagine?",
+        min_value=1, value=30, step=1
+    )
+else:  # Solo Immagini
+    sentences_per_image = st.number_input(
+        "Ogni quante frasi creare un'immagine?",
+        min_value=1, value=2, step=1
+    )
 
-# Immagini: quanti file in questa passata
-seconds_per_img = st.number_input("Ogni quanti secondi di audio creare un'immagine?", min_value=1, value=30, step=1)
-images_this_run = st.number_input(
-    "Quante immagini generare in questa passata?",
-    min_value=1, value=80, step=1
-)
-
-# Bottoni separati (2 step)
-btn_audio = st.button("🎧 Generate audio (this run)")
-btn_images = st.button("🖼️ Start images (this run)")
+generate = st.button("🚀 Genera contenuti")
 
 # ===========================
-# Path base
-# ===========================
-safe = sanitize(title)
-base = os.path.join("data", "outputs", safe) if safe else None
-if safe:
-    img_dir = os.path.join(base, "images")
-    aud_dir = os.path.join(base, "audio")
-    audio_path = os.path.join(aud_dir, "combined_audio.mp3")
-
-# ===========================
-# 🔑 Prepara cfg runtime
+# 🔧 cfg runtime
 # ===========================
 def make_runtime_cfg():
     runtime_cfg = dict(base_cfg)
@@ -248,110 +238,108 @@ def make_runtime_cfg():
     return runtime_cfg
 
 # ===========================
-# 🎧 AUDIO (step 1)
+# 🚀 Avvio generazione (con resume automatico)
 # ===========================
-if btn_audio:
-    if not (title.strip() and script.strip()):
-        st.error("Titolo e testo sono obbligatori.")
-    elif not fish_ok:
-        st.error("❌ FishAudio API key mancante (sidebar).")
-    elif not get_fishaudio_voice_id():
-        st.error("❌ FishAudio Voice ID mancante (sidebar).")
-    else:
-        os.makedirs(img_dir, exist_ok=True)
-        os.makedirs(aud_dir, exist_ok=True)
+if generate and title.strip() and script.strip():
+    safe = sanitize(title)
+    base = os.path.join("data", "outputs", safe)
+    img_dir = os.path.join(base, "images")
+    aud_dir = os.path.join(base, "audio")
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(aud_dir, exist_ok=True)
 
-        runtime_cfg = make_runtime_cfg()
+    audio_path = os.path.join(aud_dir, "combined_audio.mp3")
 
-        st.subheader("🎧 Generazione audio…")
-        aud_chunks = chunk_text(script, 3000)  # più robusto per lavori lunghi
-        st.text(f"Chunk totali: {len(aud_chunks)}  ·  Questa passata: {audio_parts_this_run}")
+    st.subheader("🔄 Generazione in corso… (riprende automaticamente se rilanci con lo stesso titolo)")
+    runtime_cfg = make_runtime_cfg()
 
-        # Genera SOLO un certo numero di parti nuove (resume automatico dentro)
-        generate_audio(
-            aud_chunks,
-            runtime_cfg,
-            aud_dir,
-            retries_per_chunk=6,
-            base_backoff=3.0,
-            sleep_between_chunks=2.0,
-            max_parts_this_run=int(audio_parts_this_run),
-            combine=True
-        )
-
-        # Download immediato (parziale o totale)
-        if os.path.exists(audio_path):
-            st.session_state["audio_path"] = audio_path
-            with open(audio_path, "rb") as f:
-                st.download_button("🎧 Scarica Audio MP3 (subito)", f, file_name="audio.mp3", mime="audio/mpeg")
+    # ---- AUDIO ----
+    if mode in ["Audio", "Entrambi"]:
+        if not fish_ok:
+            st.error("❌ FishAudio API key mancante. Inseriscila nella sidebar.")
+        elif not get_fishaudio_voice_id():
+            st.error("❌ FishAudio Voice ID mancante. Inseriscilo nella sidebar.")
         else:
-            st.warning("⚠️ Audio non trovato (verifica la cartella output).")
-
-# ===========================
-# 🖼️ IMMAGINI (step 2)
-# ===========================
-if btn_images:
-    if not (title.strip() and script.strip()):
-        st.error("Titolo e testo sono obbligatori.")
-    elif not rep_ok:
-        st.error("❌ Replicate API key mancante (sidebar).")
-    elif not get_replicate_model():
-        st.error("❌ Modello Replicate mancante (sidebar).")
-    else:
-        os.makedirs(img_dir, exist_ok=True)
-        os.makedirs(aud_dir, exist_ok=True)
-
-        runtime_cfg = make_runtime_cfg()
-
-        # Calcola i chunk testuali per le immagini
-        if os.path.exists(audio_path):
-            st.text("Calcolo numero immagini dalla durata dell'audio…")
-            try:
-                duration_sec = mp3_duration_seconds(audio_path)
-            except Exception:
-                duration_sec = 0
-            if not duration_sec:
-                duration_sec = 60.0
-            num_images = max(1, int(round(duration_sec / float(seconds_per_img))))
-            approx_chars = max(50, len(script) // max(1, num_images))
-            all_chunks = chunk_text(script, approx_chars)
-        else:
-            # fallback (se audio non c'è): 1 img ogni ~2 frasi
-            all_chunks = chunk_by_sentences_count(script, 2)
-
-        existing = len([f for f in os.listdir(img_dir) if f.startswith("img_") and f.endswith(".png")])
-        start_index = existing + 1
-        to_generate = all_chunks[existing : existing + int(images_this_run)]
-
-        if not to_generate:
-            st.info("✅ Non ci sono immagini da generare in questa passata (sei già al totale).")
-        else:
-            st.subheader("🖼️ Generazione immagini… (passata)")
-            st.text(f"Esistenti: {existing}  ·  Nuove in questa passata: {len(to_generate)}  ·  Indici: {start_index:03d}–{start_index+len(to_generate)-1:03d}")
-
-            generate_images(
-                to_generate,
+            st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
+            # Chunk robusti (3k). La funzione in utils fa resume via part_XXXX.mp3
+            aud_chunks = chunk_text(script, 3000)
+            st.text(f"🎧 Chunk totali: {len(aud_chunks)} (se si ferma, rilancia: riprende dai pezzi mancanti)")
+            generate_audio(
+                aud_chunks,
                 runtime_cfg,
-                img_dir,
-                start_index=start_index,
-                sleep_between_calls=0.0,   # gestione 429 dinamica
-                retries=7,
-                base_backoff=2.0
+                aud_dir,
+                retries_per_chunk=6,
+                base_backoff=3.0,
+                sleep_between_chunks=2.0,
+                max_parts_this_run=None,   # fa tutti i pezzi mancanti
+                combine=True
             )
 
-            zip_images(base)
-            zip_path = os.path.join(base, "output.zip")
-            if os.path.exists(zip_path):
-                st.session_state["zip_path"] = zip_path
-                with open(zip_path, "rb") as f:
-                    st.download_button("🖼️ Scarica ZIP Immagini (parziale)", f, file_name="output.zip", mime="application/zip")
+            if os.path.exists(audio_path):
+                st.session_state["audio_path"] = audio_path
+                with open(audio_path, "rb") as f:
+                    st.download_button("🎧 Scarica Audio MP3", f, file_name="audio.mp3", mime="audio/mpeg")
 
-# ---- Download (riappare a fondo pagina) ----
-if safe:
-    if os.path.exists(os.path.join(aud_dir, "combined_audio.mp3")):
-        st.session_state["audio_path"] = os.path.join(aud_dir, "combined_audio.mp3")
-    if os.path.exists(os.path.join(base, "output.zip")):
-        st.session_state["zip_path"] = os.path.join(base, "output.zip")
+    # ---- IMMAGINI ----
+    if mode in ["Immagini", "Entrambi"]:
+        if not rep_ok:
+            st.error("❌ Replicate API key mancante. Inseriscila nella sidebar.")
+        elif not get_replicate_model():
+            st.error("❌ Modello Replicate mancante. Seleziona un preset o inserisci un Custom model.")
+        else:
+            if mode == "Entrambi":
+                # Serve l’audio per capire quante immagini totali servono
+                if not os.path.exists(audio_path):
+                    st.error("❌ Audio non trovato per calcolare il numero di immagini. Genera prima l’audio.")
+                else:
+                    st.text("🖼️ Calcolo numero immagini dalla durata dell'audio…")
+                    try:
+                        duration_sec = mp3_duration_seconds(audio_path)
+                    except Exception:
+                        duration_sec = 0
+                    if not duration_sec:
+                        duration_sec = 60.0
+
+                    num_images = max(1, int(round(duration_sec / float(seconds_per_img))))
+                    approx_chars = max(50, len(script) // max(1, num_images))
+                    all_chunks = chunk_text(script, approx_chars)
+            else:
+                # SOLO IMMAGINI → per frasi
+                all_chunks = chunk_by_sentences_count(script, int(sentences_per_image))
+
+            # Resume: quante immagini abbiamo già?
+            existing = len([f for f in os.listdir(img_dir) if f.startswith("img_") and f.endswith(".png")])
+            start_index = existing + 1
+
+            to_generate = all_chunks[existing:]  # tutte le rimanenti
+            if not to_generate:
+                st.info("✅ Non ci sono immagini da generare (sei già al totale).")
+            else:
+                st.text(f"🖼️ Genero {len(to_generate)} immagini rimanenti (da {start_index:03d} a {start_index+len(to_generate)-1:03d})…")
+                # Nessun batch: 1 alla volta, gestione 429 inside, resume via start_index
+                generate_images(
+                    to_generate,
+                    runtime_cfg,
+                    img_dir,
+                    start_index=start_index,
+                    sleep_between_calls=0.0,  # gestione 429 dinamica dentro
+                    retries=7,
+                    base_backoff=2.0
+                )
+                zip_images(base)
+
+    st.success("✅ Generazione completata (se si è interrotta, rilancia con lo stesso titolo: riprende).")
+
+# ---- Download persistenti a fondo pagina ----
+safe_title = sanitize(title or "")
+if safe_title:
+    base = os.path.join("data", "outputs", safe_title)
+    aud_path = os.path.join(base, "audio", "combined_audio.mp3")
+    zip_path = os.path.join(base, "output.zip")
+    if os.path.exists(aud_path):
+        st.session_state["audio_path"] = aud_path
+    if os.path.exists(zip_path):
+        st.session_state["zip_path"] = zip_path
 
 if st.session_state.get("audio_path") and os.path.exists(st.session_state["audio_path"]):
     with open(st.session_state["audio_path"], "rb") as f:
@@ -360,4 +348,3 @@ if st.session_state.get("audio_path") and os.path.exists(st.session_state["audio
 if st.session_state.get("zip_path") and os.path.exists(st.session_state["zip_path"]):
     with open(st.session_state["zip_path"], "rb") as f:
         st.download_button("🖼️ Scarica ZIP Immagini", f, file_name="output.zip", mime="application/zip")
-

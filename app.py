@@ -295,7 +295,7 @@ if generate and title.strip() and script.strip():
             st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
             # Chunk più piccoli per evitare timeout su audio lunghi
             # (se il tuo TTS consente 30k caratteri puoi rialzare)
-            aud_chunks = chunk_text(script, 8000)
+            aud_chunks = chunk_text(script, 4000)
             # La tua funzione genera i file. Idealmente: part_0001.mp3, part_0002.mp3, ...
             generate_audio(aud_chunks, runtime_cfg, aud_dir)
 

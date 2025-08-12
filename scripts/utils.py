@@ -1,24 +1,24 @@
 # scripts/utils.py
 # -------------------------------------------------------
-# Utility: chunking testo + IMMAGINI (Replicate) + AUDIO (FishAudio)
-# Senza pydub: durate via mutagen, concatenazione via ffmpeg (imageio-ffmpeg).
-# Robusto: retry/backoff, resume, skip di pezzi già fatti.
+# Utility: chunking, IMMAGINI (Replicate) + AUDIO (FishAudio)
+# Robusto: retry/backoff, resume, plan.json per pad e totale chunk.
+# Concat include sia part_*.mp3 sia audio_*.mp3 (vecchie run).
 # -------------------------------------------------------
 
 import os
 import re
 import time
 import glob
+import json
 import subprocess
 from io import BytesIO
-from typing import List
+from typing import List, Tuple
 
 import requests
 from PIL import Image
 
 # ============== Chunking ==============
 def chunk_text(text: str, max_chars: int):
-    """Divide text in blocchi di max_chars, spezzando tra le parole."""
     words = (text or "").split()
     parts, curr, length = [], [], 0
     for w in words:
@@ -32,9 +32,7 @@ def chunk_text(text: str, max_chars: int):
         parts.append(" ".join(curr))
     return parts
 
-
 def chunk_by_sentences_count(text: str, sentences_per_chunk: int):
-    """Divide il testo in blocchi di N frasi."""
     sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', (text or "").strip()) if s.strip()]
     N = max(1, int(sentences_per_chunk or 1))
     return [" ".join(sentences[i:i + N]) for i in range(0, len(sentences), N)]
@@ -47,7 +45,7 @@ def _st():
     except Exception:
         return None
 
-# ============== Immagini (Replicate) ==============
+# ============== IMMAGINI (Replicate) ==============
 def save_image_from_url(url: str, path: str, timeout: int = 45):
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
@@ -68,16 +66,10 @@ def generate_images(
     cfg: dict,
     outdir: str,
     start_index: int = 1,
-    sleep_between_calls: float = 0.0,  # usiamo attesa dinamica su 429
+    sleep_between_calls: float = 0.0,
     retries: int = 7,
     base_backoff: float = 2.0,
 ):
-    """
-    Genera 1 immagine per elemento in `chunks` usando Replicate.
-    - Resume: se il file esiste, salta
-    - 429-aware: estrae "~Xs" dal messaggio e attende quel tempo (+margine), poi riprova
-    - Numerazione stabile con start_index
-    """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
 
@@ -91,14 +83,14 @@ def generate_images(
 
     if not api_key:
         msg = "Replicate API token assente."
-        if st: st.error("❌ " + msg)
+        if st: st.error("❌ " + msg); 
         raise ValueError(msg)
     if not model:
         msg = "Modello Replicate assente."
-        if st: st.error("❌ " + msg)
+        if st: st.error("❌ " + msg); 
         raise ValueError(msg)
 
-    import replicate, re
+    import replicate
     client = replicate.Client(api_token=api_key)
 
     results = []
@@ -119,8 +111,6 @@ def generate_images(
         while attempt < retries:
             try:
                 output = client.run(model, input=model_input)
-
-                # normalizza output in lista URL
                 urls = []
                 if isinstance(output, str):
                     urls = [output]
@@ -129,10 +119,8 @@ def generate_images(
                 elif isinstance(output, dict):
                     for k in ("image", "images", "output", "url", "urls"):
                         v = output.get(k)
-                        if isinstance(v, str):
-                            urls = [v]; break
-                        if isinstance(v, list) and v:
-                            urls = v; break
+                        if isinstance(v, str): urls = [v]; break
+                        if isinstance(v, list) and v: urls = v; break
 
                 _download_first(urls, outpath)
                 if st: st.write(f"✅ Immagine {j:03d} salvata")
@@ -143,22 +131,16 @@ def generate_images(
             except Exception as e:
                 last_err = e
                 msg = str(e)
-
-                # 429: estrai "~9s" e dormi quel tempo + 2s
+                # 429: estrai "~9s" se presente e attendi esattamente quel tempo + margine
                 if "429" in msg:
                     wait = 12
                     m = re.search(r"~(\d+)s", msg)
                     if m:
-                        try:
-                            wait = int(m.group(1)) + 2
-                        except Exception:
-                            wait = 12
-                    if st: st.warning(f"⚠️ Rate limit: aspetto {wait}s e riprovo (img {j:03d})")
+                        try: wait = int(m.group(1)) + 2
+                        except Exception: wait = 12
+                    if st: st.warning(f"⚠️ Rate limit: aspetto {wait}s (img {j:03d})")
                     time.sleep(wait)
-                    # NON contiamo questo come tentativo “vero”
-                    continue
-
-                # altri errori → backoff crescente
+                    continue  # non contare come tentativo
                 attempt += 1
                 sleep_s = base_backoff * attempt
                 if st: st.warning(f"⚠️ Retry {attempt}/{retries} img {j:03d}: {e} (sleep {sleep_s:.1f}s)")
@@ -172,18 +154,55 @@ def generate_images(
 
     return results
 
-# ============== Audio (FishAudio) ==============
+# ============== AUDIO (FishAudio) ==============
 
 def mp3_duration_seconds(path: str) -> float:
-    """Durata MP3 (secondi) via mutagen."""
     try:
         from mutagen.mp3 import MP3
         return float(MP3(path).info.length)
     except Exception:
         return 0.0
 
+def _pad_width_for_total(total: int) -> int:
+    return max(2, len(str(max(1, total))))
+
+def _seq_from_name(name: str) -> int | None:
+    """
+    Estrae la sequenza da 'part_0007.mp3' o 'audio_07.mp3'.
+    """
+    m = re.search(r'(?:part|audio)_(\d+)\.mp3$', name)
+    return int(m.group(1)) if m else None
+
+def _list_existing_parts(outdir: str) -> List[Tuple[int, str]]:
+    paths = glob.glob(os.path.join(outdir, "part_*.mp3")) + glob.glob(os.path.join(outdir, "audio_*.mp3"))
+    items: List[Tuple[int, str]] = []
+    for p in paths:
+        seq = _seq_from_name(os.path.basename(p))
+        if seq is not None and mp3_duration_seconds(p) > 0.5:
+            items.append((seq, p))
+    items.sort(key=lambda x: x[0])
+    return items
+
+def _write_plan(outdir: str, planned_total: int, pad: int):
+    try:
+        with open(os.path.join(outdir, "plan.json"), "w", encoding="utf-8") as f:
+            json.dump({"planned_total": planned_total, "pad": pad}, f)
+    except Exception:
+        pass
+
+def _read_plan(outdir: str) -> tuple[int | None, int | None]:
+    try:
+        with open(os.path.join(outdir, "plan.json"), "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return int(d.get("planned_total")) if d.get("planned_total") else None, int(d.get("pad")) if d.get("pad") else None
+    except Exception:
+        return None, None
+
 def concat_mp3s(paths: List[str], out_path: str, bitrate_kbps: int = 128):
-    """Concatena MP3 con ffmpeg (ricodifica libmp3lame per robustezza)."""
+    """
+    Concatena MP3 con ffmpeg (ricodifica libmp3lame per robustezza).
+    Include entrambi gli schemi di nome (part_*.mp3, audio_*.mp3).
+    """
     paths = [p for p in paths if p and os.path.exists(p)]
     if not paths:
         raise RuntimeError("Nessun file MP3 da concatenare.")
@@ -228,10 +247,6 @@ def _download_with_retry(url: str, retries: int = 3, timeout: int = 45) -> bytes
             time.sleep(1.5 + attempt * 1.0)
     raise last_exc or RuntimeError("Download fallito")
 
-def _pad_width(n: int) -> int:
-    """Zero-pad per i nomi file (99->2, 1000->4, ecc.)."""
-    return max(2, len(str(max(1, n))))
-
 def generate_audio(
     chunks: List[str],
     cfg: dict,
@@ -245,10 +260,10 @@ def generate_audio(
     combine: bool = True,
 ):
     """
-    Genera audio in parti numerate (part_0001.mp3, …) con resume automatico.
-    - Se il job si interrompe, basta rilanciare: salta i part già presenti.
-    - max_parts_this_run: quante NUOVE parti creare in questa passata (Streamlit Cloud friendly).
-    - combine: se True, crea/aggiorna combined_audio.mp3 concatenando TUTTE le part presenti.
+    Genera audio in parti numerate con resume.
+    - Salva plan.json con 'planned_total' e 'pad' (cifre fisse).
+    - Considera sia part_*.mp3 sia audio_*.mp3 come “già esistenti”.
+    - NON supera il totale pianificato (se 48, non tenta 49).
     """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
@@ -260,33 +275,54 @@ def generate_audio(
 
     if not api_key:
         msg = "FishAudio API key assente. Imposta 'fishaudio_api_key' in cfg."
-        if st: st.error("❌ " + msg)
+        if st: st.error("❌ " + msg); 
         raise ValueError(msg)
     if not voice_id:
         msg = "FishAudio Voice ID assente. Imposta 'fishaudio_voice' o 'fishaudio_voice_id' in cfg."
-        if st: st.error("❌ " + msg)
+        if st: st.error("❌ " + msg); 
         raise ValueError(msg)
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-
     session = requests.Session()
 
-    # Resume: trova il prossimo indice
-    existing_parts = sorted(glob.glob(os.path.join(outdir, "part_*.mp3")))
-    next_seq = len(existing_parts) + 1
+    planned_total = len(chunks)
+    planned_in_plan, pad_in_plan = _read_plan(outdir)
+    if not planned_in_plan:
+        planned_in_plan = planned_total
+    # pad fisso: se esiste in plan usalo, altrimenti calcolalo e scrivilo
+    pad = pad_in_plan if pad_in_plan else _pad_width_for_total(planned_in_plan)
+    _write_plan(outdir, planned_in_plan, pad)
+
+    existing = _list_existing_parts(outdir)  # [(seq, path)]
+    max_seq_done = max([seq for seq, _ in existing], default=0)
+
+    # se start_index è forzato e più alto, usa quello
+    next_seq = max_seq_done + 1
     if start_index and start_index > next_seq:
         next_seq = start_index
 
-    # calcola da quale chunk partire (0-based)
-    start_chunk_idx = next_seq - 1
-    remaining_chunks = chunks[start_chunk_idx:]
-    pad = _pad_width(len(chunks) + len(existing_parts) + 5)
+    # NON superare il totale pianificato
+    if next_seq > planned_in_plan:
+        if st: st.info(f"✅ Audio già completo ({planned_in_plan} parti). Aggiorno solo il combinato…")
+        # combina e ritorna
+        if combine:
+            all_parts = [p for _, p in existing]
+            if not all_parts:
+                raise RuntimeError("Nessun audio generato.")
+            out_path = os.path.join(outdir, "combined_audio.mp3")
+            concat_mp3s(all_parts, out_path, bitrate_kbps=128)
+            if st: st.success("🔊 Audio combinato aggiornato.")
+            return out_path
+        return None
 
     if st:
-        st.write(f"▶️ Resume audio: parti esistenti {len(existing_parts)}; genero da part {next_seq:0{pad}d}")
+        st.write(f"▶️ Resume audio: totale previsto {planned_in_plan} · già fatte {len(existing)} · inizio da {next_seq:0{pad}d}")
+
+    # lavora solo sulle parti rimanenti
+    remaining_chunks = chunks[next_seq - 1 : planned_in_plan]
 
     new_generated = 0
     for text in remaining_chunks:
@@ -295,7 +331,7 @@ def generate_audio(
 
         part_path = os.path.join(outdir, f"part_{next_seq:0{pad}d}.mp3")
 
-        # se esiste ed è valido, salta
+        # se esiste valido, salta
         if os.path.exists(part_path) and mp3_duration_seconds(part_path) > 0.5:
             if st: st.write(f"⏭️ Skip part {next_seq:0{pad}d} (già presente)")
             next_seq += 1
@@ -355,13 +391,15 @@ def generate_audio(
         next_seq += 1
         time.sleep(sleep_between_chunks)
 
-    # Concatena TUTTE le part_*.mp3 (anche di run precedenti)
+    # Concatena TUTTE le parti (part_* e audio_*)
     if combine:
-        parts = sorted(glob.glob(os.path.join(outdir, "part_*.mp3")))
-        if not parts:
+        existing = _list_existing_parts(outdir)  # ricalcola
+        if not existing:
             raise RuntimeError("Nessun audio generato.")
+        # ordina per seq e prendi i path
+        paths = [p for _, p in existing]
         out_path = os.path.join(outdir, "combined_audio.mp3")
-        concat_mp3s(parts, out_path, bitrate_kbps=128)
+        concat_mp3s(paths, out_path, bitrate_kbps=128)
         total_ms = int(mp3_duration_seconds(out_path) * 1000)
         if st:
             st.write(f"🔊 Durata totale audio attuale: {total_ms} ms")

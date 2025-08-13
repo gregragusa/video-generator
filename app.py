@@ -1,11 +1,8 @@
 # app.py
 # -------------------------------------------------------
-# UI "semplice": Titolo, Testo, Modalità, seconds-per-image / sentences-per-image,
-# un solo bottone "Genera contenuti".
-# Robustezza:
-# - AUDIO: spezzato in part_XXXX.mp3 con resume + combined_audio.mp3 (merge)
-# - IMMAGINI: img_XXX.png con resume; 1-per-volta (retry + attesa dinamica su 429 in utils)
-# - Download audio/zip con chiavi diverse (evita StreamlitDuplicateElementId)
+# UI semplice + resume automatico per AUDIO (part_XXXX + merge) e IMMAGINI (img_XXX).
+# Niente pydub: durata MP3 via mutagen (in utils) + concat via imageio-ffmpeg.
+# Download buttons con key uniche per evitare StreamlitDuplicateElementId.
 # -------------------------------------------------------
 
 import os

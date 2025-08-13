@@ -3,6 +3,7 @@
 # Utility: chunking, IMMAGINI (Replicate) + AUDIO (FishAudio)
 # Robusto: retry/backoff, resume, plan.json per pad e totale chunk.
 # Concat include sia part_*.mp3 sia audio_*.mp3 (vecchie run).
+# NIENTE pydub: durata MP3 via mutagen, concat via imageio-ffmpeg.
 # -------------------------------------------------------
 
 import os
@@ -143,7 +144,7 @@ def generate_images(
                     continue  # non contare come tentativo
                 attempt += 1
                 sleep_s = base_backoff * attempt
-                if st: st.warning(f"⚠️ Retry {attempt}/{retries} img {j:03d}: {e} (sleep {sleep_s:.1f}s)")
+                if st: st.warning(f"⚠️ Retry {attempt+1}/{retries} img {j:03d}: {e} (sleep {sleep_s:.1f}s)")
                 time.sleep(sleep_s)
 
         if not success:
@@ -292,22 +293,18 @@ def generate_audio(
     planned_in_plan, pad_in_plan = _read_plan(outdir)
     if not planned_in_plan:
         planned_in_plan = planned_total
-    # pad fisso: se esiste in plan usalo, altrimenti calcolalo e scrivilo
     pad = pad_in_plan if pad_in_plan else _pad_width_for_total(planned_in_plan)
     _write_plan(outdir, planned_in_plan, pad)
 
     existing = _list_existing_parts(outdir)  # [(seq, path)]
     max_seq_done = max([seq for seq, _ in existing], default=0)
 
-    # se start_index è forzato e più alto, usa quello
     next_seq = max_seq_done + 1
     if start_index and start_index > next_seq:
         next_seq = start_index
 
-    # NON superare il totale pianificato
     if next_seq > planned_in_plan:
         if st: st.info(f"✅ Audio già completo ({planned_in_plan} parti). Aggiorno solo il combinato…")
-        # combina e ritorna
         if combine:
             all_parts = [p for _, p in existing]
             if not all_parts:
@@ -321,7 +318,6 @@ def generate_audio(
     if st:
         st.write(f"▶️ Resume audio: totale previsto {planned_in_plan} · già fatte {len(existing)} · inizio da {next_seq:0{pad}d}")
 
-    # lavora solo sulle parti rimanenti
     remaining_chunks = chunks[next_seq - 1 : planned_in_plan]
 
     new_generated = 0
@@ -331,7 +327,6 @@ def generate_audio(
 
         part_path = os.path.join(outdir, f"part_{next_seq:0{pad}d}.mp3")
 
-        # se esiste valido, salta
         if os.path.exists(part_path) and mp3_duration_seconds(part_path) > 0.5:
             if st: st.write(f"⏭️ Skip part {next_seq:0{pad}d} (già presente)")
             next_seq += 1
@@ -391,12 +386,10 @@ def generate_audio(
         next_seq += 1
         time.sleep(sleep_between_chunks)
 
-    # Concatena TUTTE le parti (part_* e audio_*)
     if combine:
         existing = _list_existing_parts(outdir)  # ricalcola
         if not existing:
             raise RuntimeError("Nessun audio generato.")
-        # ordina per seq e prendi i path
         paths = [p for _, p in existing]
         out_path = os.path.join(outdir, "combined_audio.mp3")
         concat_mp3s(paths, out_path, bitrate_kbps=128)

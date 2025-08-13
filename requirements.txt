@@ -1,6 +1,9 @@
-streamlit
-requests
-Pillow
-mutagen
-imageio-ffmpeg
-replicate
+streamlit==1.48.0
+requests==2.32.4
+pillow==11.3.0
+mutagen==1.47.0
+imageio-ffmpeg==0.6.0
+replicate==1.0.7
+httpx==0.28.1
+pydantic==2.11.7
+typing-inspection==0.4.1

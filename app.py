@@ -279,14 +279,18 @@ if generate and title.strip() and script.strip():
     st.session_state["is_generating"] = True
     
     try:
-        # Validazione lunghezza script
-        if len(script) > 50000:
-            st.error("❌ Script troppo lungo! Massimo 50.000 caratteri.")
-            st.stop()
-        
+        # Info lunghezza script (senza limiti)
+        char_count = len(script)
         word_count = len(script.split())
-        if word_count > 8000:
-            st.warning(f"⚠️ Script molto lungo ({word_count} parole). Generazione potrebbe essere lenta.")
+        
+        # Mostra statistiche script
+        st.info(f"📝 Script: {char_count:,} caratteri | {word_count:,} parole")
+        
+        # Solo avviso per script molto lunghi (senza bloccare)
+        if char_count > 100000:
+            st.warning(f"⚠️ Script molto lungo ({char_count:,} caratteri). La generazione richiederà più tempo.")
+        if char_count > 300000:
+            st.warning(f"🔥 Script EXTRA-lungo! Considera di dividerlo in parti più piccole per evitare timeout.")
 
         safe = sanitize(title)
         base = os.path.join("data", "outputs", safe)

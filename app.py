@@ -26,7 +26,6 @@ from scripts.utils import (
     generate_audio,
     generate_images,
     mp3_duration_seconds,  # util per leggere durata MP3
-    display_timeline,  # funzione timeline
 )
 
 # ---------------------------
@@ -121,10 +120,74 @@ class ProgressTracker:
         completed = len([s for s in self.steps if s["status"] == "completed"])
         return min(100, (completed / len(self.steps)) * 100)
 
-def display_timeline_wrapper(tracker: ProgressTracker, container):
-    """Wrapper per display_timeline importata da utils"""
-    from scripts.utils import display_timeline
-    display_timeline(tracker, container)
+def display_timeline(tracker: ProgressTracker, container):
+    """Mostra timeline real-time in un container Streamlit"""
+    
+    if not tracker.start_time:
+        return
+    
+    with container:
+        # Header con metriche
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            elapsed = tracker.get_elapsed_time()
+            st.metric("⏱️ Trascorso", f"{elapsed/60:.1f} min")
+        
+        with col2:
+            eta = tracker.get_eta()
+            st.metric("🎯 ETA", f"{eta/60:.1f} min")
+        
+        with col3:
+            total_estimate = (elapsed + eta) / 60
+            st.metric("📊 Totale Stimato", f"{total_estimate:.1f} min")
+        
+        with col4:
+            completed = len([s for s in tracker.steps if s["status"] == "completed"])
+            st.metric("✅ Completati", f"{completed}/{len(tracker.steps)}")
+        
+        # Progress bar generale
+        progress = tracker.get_completion_percentage() / 100
+        st.progress(progress, text=f"Progresso generale: {progress*100:.1f}%")
+        
+        # Timeline dettagliata
+        st.markdown("### 📋 Timeline Dettagliata")
+        
+        for i, step in enumerate(tracker.steps):
+            # Determina icona e stile
+            if step["status"] == "completed":
+                icon = "✅"
+                style = ""
+            elif step["status"] == "failed":
+                icon = "❌"
+                style = ""
+            elif step["status"] == "running":
+                icon = "🔄"
+                style = "**"
+            else:
+                icon = "⏳"
+                style = ""
+            
+            # Calcola tempo
+            if step["duration"]:
+                time_str = f"({step['duration']:.1f}s)"
+            elif step["status"] == "running":
+                running_time = (datetime.now() - step["start_time"]).total_seconds()
+                time_str = f"({running_time:.1f}s...)"
+            else:
+                time_str = ""
+            
+            # Mostra step principale
+            step_text = f"{icon} {style}{step['description']}{style} {time_str}"
+            st.markdown(step_text)
+            
+            # Mostra substeps (ultimi 3 per step attivo)
+            if step["substeps"]:
+                substeps_to_show = step["substeps"][-3:] if step["status"] == "running" else step["substeps"][-1:]
+                
+                for substep in substeps_to_show:
+                    substep_icon = "✅" if substep["status"] == "completed" else "❌"
+                    st.markdown(f"   └ {substep_icon} {substep['description']}")
 
 # ---------------------------
 # Utility Functions
@@ -481,9 +544,10 @@ if generate and title.strip() and script.strip():
         # Inizializza tracker con stime
         tracker.start(len(aud_chunks), estimated_images)
         
-        # Passa tracker alle funzioni
+        # Passa tracker E display_timeline alle funzioni
         runtime_cfg["progress_tracker"] = tracker
         runtime_cfg["timeline_container"] = timeline_container
+        runtime_cfg["display_timeline_func"] = display_timeline
 
         st.success(f"🎯 **Generazione Iniziata!** Stimati {len(aud_chunks)} chunk audio + {estimated_images} immagini")
         

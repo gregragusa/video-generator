@@ -50,21 +50,36 @@ def chunk_by_sentences_count(text: str, sentences_per_chunk: int):
     N = max(1, int(sentences_per_chunk or 1))
     return [" ".join(sentences[i:i + N]) for i in range(0, len(sentences), N)]
 
-# NUOVO: Chunking specifico per audio - mantiene circa 2000 caratteri
-def chunk_text_for_audio(text: str, target_chars: int = 2000):
+# NUOVO: Chunking specifico per audio - gestisce script lunghi fino a 500k caratteri
+def chunk_text_for_audio(text: str, target_chars: int = 2000, max_chars: int = 3000):
     """
     Chunking specifico per audio - mantiene frasi complete e mira a ~2000 caratteri
-    """
-    if not text or len(text) <= target_chars:
-        return [text] if text else []
+    Ottimizzato per script molto lunghi (200k+ caratteri)
     
-    # Dividi per frasi
-    sentences = re.split(r'(?<=[.?!])\s+', text.strip())
+    Args:
+        text: Testo da dividere
+        target_chars: Caratteri target per chunk (default 2000)
+        max_chars: Caratteri massimi per chunk prima di forzare split (default 3000)
+    """
+    if not text:
+        return []
+    
+    # Per script molto lunghi, mostra progress
+    original_length = len(text)
+    if original_length <= target_chars:
+        return [text]
+    
+    # Dividi per frasi (supporta anche ;)
+    sentences = re.split(r'(?<=[.?!;])\s+', text.strip())
     
     chunks = []
     current_chunk = ""
     
-    for sentence in sentences:
+    for i, sentence in enumerate(sentences):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+            
         # Test se aggiungendo questa frase supero il target
         test_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
         
@@ -72,23 +87,32 @@ def chunk_text_for_audio(text: str, target_chars: int = 2000):
             current_chunk = test_chunk
         else:
             # Se la frase corrente è troppo lunga da sola, spezzala
-            if len(sentence) > target_chars:
+            if len(sentence) > max_chars:
                 # Salva chunk corrente se non vuoto
                 if current_chunk:
                     chunks.append(current_chunk)
                     current_chunk = ""
                 
-                # Spezza la frase lunga per parole
+                # Spezza la frase lunga per parole, poi per caratteri se necessario
                 words = sentence.split()
                 temp_chunk = ""
+                
                 for word in words:
                     test_word_chunk = (temp_chunk + " " + word).strip() if temp_chunk else word
-                    if len(test_word_chunk) <= target_chars:
+                    
+                    if len(test_word_chunk) <= max_chars:
                         temp_chunk = test_word_chunk
                     else:
                         if temp_chunk:
                             chunks.append(temp_chunk)
-                        temp_chunk = word
+                        
+                        # Se una singola parola è troppo lunga, spezzala per caratteri
+                        if len(word) > max_chars:
+                            for j in range(0, len(word), max_chars):
+                                chunks.append(word[j:j + max_chars])
+                            temp_chunk = ""
+                        else:
+                            temp_chunk = word
                 
                 if temp_chunk:
                     current_chunk = temp_chunk
@@ -101,6 +125,10 @@ def chunk_text_for_audio(text: str, target_chars: int = 2000):
     # Aggiungi ultimo chunk
     if current_chunk:
         chunks.append(current_chunk)
+    
+    # Log per script lunghi
+    if original_length > 50000:
+        print(f"[CHUNKING] Script {original_length:,} chars → {len(chunks)} chunks (avg: {original_length//len(chunks):,} chars)")
     
     return chunks
 
@@ -372,6 +400,7 @@ def generate_audio(chunks, cfg: dict, outdir: str,
     """
     Genera audio da ogni blocco di testo in `chunks` con FishAudio e li concatena.
     VERSIONE CORRETTA con logging chunking e timeout migliorati
+    Ottimizzata per script lunghi (200k+ caratteri)
     """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
@@ -390,11 +419,19 @@ def generate_audio(chunks, cfg: dict, outdir: str,
         if st: st.error("❌ " + msg)
         raise ValueError(msg)
 
-    # LOG CHUNKING INFO
+    # LOG CHUNKING INFO (migliorato per script lunghi)
     if st:
         total_chars = sum(len(chunk) for chunk in chunks)
         avg_chars = total_chars / len(chunks) if chunks else 0
-        st.write(f"📊 Audio chunking: {len(chunks)} segmenti | Totale: {total_chars} char | Media: {avg_chars:.0f} char/segmento")
+        min_chars = min(len(chunk) for chunk in chunks) if chunks else 0
+        max_chars = max(len(chunk) for chunk in chunks) if chunks else 0
+        
+        st.write(f"📊 Audio chunking: {len(chunks)} segmenti")
+        st.write(f"📈 Caratteri: Totale {total_chars:,} | Media {avg_chars:.0f} | Min {min_chars:,} | Max {max_chars:,}")
+        
+        # Stima durata (approssimativa: ~150 parole/minuto, ~5 caratteri/parola)
+        estimated_minutes = (total_chars / 5) / 150
+        st.write(f"⏱️ Durata stimata audio: ~{estimated_minutes:.1f} minuti")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -404,12 +441,24 @@ def generate_audio(chunks, cfg: dict, outdir: str,
         headers["model"] = model
 
     audio_paths = []
+    failed_count = 0
+
+    # Progress bar per script lunghi
+    if st and len(chunks) > 10:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+    else:
+        progress_bar = None
+        status_text = None
 
     for i, text in enumerate(chunks, 1):
-        if st:
-            st.write(f"🎧 Audio {i}/{len(chunks)}…")
+        if progress_bar:
+            progress_bar.progress(i / len(chunks))
+            status_text.text(f"🎧 Generando audio {i}/{len(chunks)} ({len(text)} caratteri)...")
+        elif st:
+            st.write(f"🎧 Audio {i}/{len(chunks)} ({len(text)} caratteri)...")
         else:
-            print(f" • Audio {i}/{len(chunks)}…", end=" ")
+            print(f" • Audio {i}/{len(chunks)} ({len(text)} chars)…", end=" ")
 
         payload = {
             "text": text,
@@ -423,12 +472,12 @@ def generate_audio(chunks, cfg: dict, outdir: str,
             payload.update(extra)
 
         try:
-            resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=120)  # AUMENTATO timeout
+            resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=180)  # AUMENTATO timeout per chunk lunghi
             if resp.status_code >= 400:
                 detail = resp.text[:500]
-                if st: st.error(f"❌ HTTP {resp.status_code} FishAudio: {detail}")
-                else: print(f"HTTP {resp.status_code} FishAudio: {detail}")
-                # passa al prossimo chunk senza interrompere tutto
+                if st: st.error(f"❌ HTTP {resp.status_code} FishAudio chunk {i}: {detail}")
+                else: print(f"HTTP {resp.status_code} FishAudio chunk {i}: {detail}")
+                failed_count += 1
                 continue
 
             ct = resp.headers.get("Content-Type", "")
@@ -437,45 +486,66 @@ def generate_audio(chunks, cfg: dict, outdir: str,
                 audio_url = data.get("audio_url") or data.get("url")
                 audio_b64 = data.get("audio_base64") or data.get("audio")
                 if audio_url:
-                    audio_bytes = _download_with_retry(audio_url, retries=5, timeout=60)
+                    audio_bytes = _download_with_retry(audio_url, retries=5, timeout=90)  # AUMENTATO timeout download
                 elif audio_b64:
                     audio_bytes = base64.b64decode(audio_b64)
                 else:
-                    if st: st.error(f"❌ Risposta JSON inattesa: {data}")
-                    else: print(f"JSON inatteso: {data}")
+                    if st: st.error(f"❌ Risposta JSON inattesa chunk {i}: {data}")
+                    else: print(f"JSON inatteso chunk {i}: {data}")
+                    failed_count += 1
                     continue
             else:
                 audio_bytes = resp.content
 
-            path = os.path.join(outdir, f"audio_{i:02d}.mp3")
+            path = os.path.join(outdir, f"audio_{i:03d}.mp3")  # 3 cifre per supportare 999+ chunk
             with open(path, "wb") as f:
                 f.write(audio_bytes)
 
-            dur_ms = int(mp3_duration_seconds(path) * 1000)
-            if st:
-                st.write(f"✅ TTS chunk {i:02d} durata: {dur_ms} ms")
+            dur_sec = mp3_duration_seconds(path)
+            if progress_bar:
+                # Non loggare ogni singolo chunk per script lunghi
+                pass
+            elif st:
+                st.write(f"✅ TTS chunk {i:03d} durata: {dur_sec:.1f}s")
             else:
-                print(f"[TTS] chunk {i:02d} duration: {dur_ms} ms — ✅")
+                print(f"[TTS] chunk {i:03d} duration: {dur_sec:.1f}s — ✅")
 
             audio_paths.append(path)
 
         except Exception as e:
+            failed_count += 1
             if st: st.error(f"❌ Errore TTS sul chunk {i}: {e}")
             else: print("❌", f"Errore TTS sul chunk {i}: {e}")
             continue
 
+    # Cleanup progress bar
+    if progress_bar:
+        progress_bar.empty()
+        status_text.empty()
+
+    # Report finale
+    if failed_count > 0:
+        if st:
+            st.warning(f"⚠️ {failed_count} chunk audio falliti su {len(chunks)} totali")
+        else:
+            print(f"[WARNING] {failed_count} failed audio chunks out of {len(chunks)}")
+
     if not audio_paths:
-        # Non alziamo eccezione dura: l'app gestisce e mostra messaggio
         return None
+
+    # Concatenazione con progress per script lunghi
+    if st and len(audio_paths) > 20:
+        st.write(f"🔗 Concatenando {len(audio_paths)} file audio...")
 
     out_path = os.path.join(outdir, "combined_audio.mp3")
     concat_mp3s(audio_paths, out_path, bitrate_kbps=128)
 
+    final_duration = mp3_duration_seconds(out_path)
     if st:
-        st.write(f"🔊 Durata totale audio: {int(mp3_duration_seconds(out_path)*1000)} ms")
+        st.write(f"🔊 Durata totale audio finale: {final_duration:.1f} secondi ({final_duration/60:.1f} minuti)")
         st.success("🔊 Audio finale creato.")
     else:
-        print(f"[TTS] combined length: {mp3_duration_seconds(out_path):.2f}s")
+        print(f"[TTS] Final audio: {final_duration:.2f}s ({final_duration/60:.1f}min)")
         print("🔊 Audio finale creato.")
 
     return out_path

@@ -16,78 +16,6 @@ from datetime import datetime
 import requests
 from PIL import Image
 
-# ============== Timeline Display Function ==============
-
-def display_timeline(tracker, container):
-    """Mostra timeline real-time in un container Streamlit"""
-    
-    st = _st()
-    if not st or not tracker or not tracker.start_time:
-        return
-    
-    with container:
-        # Header con metriche
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            elapsed = tracker.get_elapsed_time()
-            st.metric("⏱️ Trascorso", f"{elapsed/60:.1f} min")
-        
-        with col2:
-            eta = tracker.get_eta()
-            st.metric("🎯 ETA", f"{eta/60:.1f} min")
-        
-        with col3:
-            total_estimate = (elapsed + eta) / 60
-            st.metric("📊 Totale Stimato", f"{total_estimate:.1f} min")
-        
-        with col4:
-            completed = len([s for s in tracker.steps if s["status"] == "completed"])
-            st.metric("✅ Completati", f"{completed}/{len(tracker.steps)}")
-        
-        # Progress bar generale
-        progress = tracker.get_completion_percentage() / 100
-        st.progress(progress, text=f"Progresso generale: {progress*100:.1f}%")
-        
-        # Timeline dettagliata
-        st.markdown("### 📋 Timeline Dettagliata")
-        
-        for i, step in enumerate(tracker.steps):
-            # Determina icona e stile
-            if step["status"] == "completed":
-                icon = "✅"
-                style = ""
-            elif step["status"] == "failed":
-                icon = "❌"
-                style = ""
-            elif step["status"] == "running":
-                icon = "🔄"
-                style = "**"
-            else:
-                icon = "⏳"
-                style = ""
-            
-            # Calcola tempo
-            if step["duration"]:
-                time_str = f"({step['duration']:.1f}s)"
-            elif step["status"] == "running":
-                running_time = (datetime.now() - step["start_time"]).total_seconds()
-                time_str = f"({running_time:.1f}s...)"
-            else:
-                time_str = ""
-            
-            # Mostra step principale
-            step_text = f"{icon} {style}{step['description']}{style} {time_str}"
-            st.markdown(step_text)
-            
-            # Mostra substeps (ultimi 3 per step attivo)
-            if step["substeps"]:
-                substeps_to_show = step["substeps"][-3:] if step["status"] == "running" else step["substeps"][-1:]
-                
-                for substep in substeps_to_show:
-                    substep_icon = "✅" if substep["status"] == "completed" else "❌"
-                    st.markdown(f"   └ {substep_icon} {substep['description']}")
-
 # ============== Chunking Functions ==============
 
 def chunk_text(text: str, max_chars: int):
@@ -273,6 +201,8 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
     # Timeline tracker
     tracker = cfg.get("progress_tracker")
     timeline_container = cfg.get("timeline_container")
+    display_timeline_func = cfg.get("display_timeline_func")  # Funzione passata da app.py
+    display_timeline_func = cfg.get("display_timeline_func")  # Funzione passata da app.py
     
     # Sleep dinamico basato su modalità velocità
     if sleep_between_calls is None:
@@ -292,7 +222,7 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
         model = f"{model}:latest"
         if tracker:
             tracker.add_substep(tracker.current_step, f"🔧 Modello normalizzato: {model}", "completed")
-            display_timeline(tracker, timeline_container)
+            _update_timeline(tracker, timeline_container, display_timeline_func)
         elif st:
             st.info(f"🔧 Aggiunto tag :latest → `{model}`")
 
@@ -327,13 +257,13 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
             raise ValueError(error_msg)
         elif resp.status_code == 200 and tracker:
             tracker.add_substep(tracker.current_step, f"✅ Modello verificato: {model}", "completed")
-            display_timeline(tracker, timeline_container)
+            _update_timeline(tracker, timeline_container, display_timeline_func)
         
     except requests.exceptions.RequestException as e:
         warning_msg = f"Impossibile verificare modello: {e} - Procedendo..."
         if tracker:
             tracker.add_substep(tracker.current_step, f"⚠️ {warning_msg}", "completed")
-            display_timeline(tracker, timeline_container)
+            _update_timeline(tracker, timeline_container, display_timeline_func)
         elif st:
             st.warning(f"⚠️ {warning_msg}")
 
@@ -342,8 +272,7 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
     if tracker:
         tracker.add_substep(tracker.current_step, f"🔐 Token: {masked} | 🧩 Modello: {model}", "completed")
         # Update timeline per mostrare info iniziali
-        if timeline_container:
-            display_timeline(tracker, timeline_container)
+        _update_timeline(tracker, timeline_container, display_timeline_func)
     elif st:
         st.write(f"🔐 Token: {masked} | 🧩 Modello: `{model}`")
 
@@ -359,8 +288,7 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
             # Aggiungi substep per questa immagine
             img_substep = f"🎨 Immagine {idx}/{len(chunks)}: Generazione..."
             tracker.add_substep(tracker.current_step, img_substep, "running")
-            if timeline_container:
-                display_timeline(tracker, timeline_container)
+            _update_timeline(tracker, timeline_container, display_timeline_func)
         elif st:
             st.write(f"🎨 Generando immagine {idx}/{len(chunks)}...")
 
@@ -407,8 +335,7 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
                     eta_minutes = (remaining * avg_time) / 60
                     tracker.add_substep(tracker.current_step, f"⏱️ ETA rimanente: {eta_minutes:.1f} min", "completed")
                 
-                if timeline_container:
-                    display_timeline(tracker, timeline_container)
+                _update_timeline(tracker, timeline_container, display_timeline_func)
             elif st:
                 st.write(f"✅ Immagine {idx} generata: `{os.path.basename(outpath)}` ({step_duration:.1f}s)")
 

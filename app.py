@@ -285,7 +285,7 @@ with st.sidebar:
     rep_prefill = st.session_state.get("replicate_api_key", "")
     fish_prefill = st.session_state.get("fish_audio_api_key", "")
 
-    with st.form("api_keys_form", clear_on_submit=False):
+    with st.form("api_keys_form_main", clear_on_submit=False):
         replicate_key = st.text_input(
             "Replicate API key",
             type="password",
@@ -300,7 +300,7 @@ with st.sidebar:
             placeholder="fa_************************",
             help="Necessaria per generare AUDIO (FishAudio)"
         )
-        save_keys = st.form_submit_button("💾 Save")
+        save_keys = st.form_submit_button("💾 Salva API Keys")
 
     if save_keys:
         st.session_state["replicate_api_key"] = replicate_key.strip()
@@ -308,7 +308,7 @@ with st.sidebar:
         st.success("Chiavi salvate nella sessione!")
 
     st.subheader("🔎 Verifica token Replicate")
-    if st.button("Verifica token"):
+    if st.button("🔍 Verifica Token Replicate", key="verify_token_btn"):
         tok = _clean_token(st.session_state.get("replicate_api_key", ""))
         if not tok:
             st.error("Nessun token Replicate inserito.")
@@ -377,7 +377,7 @@ with st.sidebar:
     # Test modello Replicate
     st.subheader("🧪 Test Modello Replicate")
     current_model = effective_model
-    if current_model and st.button("Test Modello Corrente"):
+    if current_model and st.button("🧪 Test Modello", key="test_model_btn"):
         rep_key = st.session_state.get("replicate_api_key", "").strip()
         if not rep_key:
             st.error("❌ API key Replicate mancante")
@@ -470,7 +470,7 @@ with col_main:
         if char_count > 100000:
             st.warning(f"⚠️ Script molto lungo! Generazione stimata: {char_count/10000:.1f}-{char_count/5000:.1f} minuti")
 
-    generate = st.button("🚀 Genera contenuti", type="primary", use_container_width=True)
+    generate = st.button("🚀 Genera contenuti", type="primary", use_container_width=True, key="generate_btn")
 
 with col_timeline:
     st.subheader("📊 Timeline Generazione")
@@ -756,7 +756,7 @@ with download_col1:
                     f.read(),
                     file_name=f"{sanitize(title or 'audio')}.mp3", 
                     mime="audio/mpeg",
-                    key="download-audio-persistent",
+                    key="download-audio-main",
                     use_container_width=True
                 )
         else:
@@ -797,7 +797,7 @@ with download_col2:
                     f.read(),
                     file_name=f"{sanitize(title or 'images')}.zip", 
                     mime="application/zip",
-                    key="download-zip-persistent",
+                    key="download-zip-main",
                     use_container_width=True
                 )
         else:
@@ -812,7 +812,7 @@ col_clear, col_info = st.columns([1, 2])
 
 with col_clear:
     if st.session_state.get("audio_ready") or st.session_state.get("zip_ready"):
-        if st.button("🗑️ Pulisci Download", help="Rimuove i file dalla lista download", use_container_width=True):
+        if st.button("🗑️ Pulisci Download", help="Rimuove i file dalla lista download", use_container_width=True, key="clear_downloads_btn"):
             st.session_state["audio_ready"] = False
             st.session_state["zip_ready"] = False
             st.session_state.pop("audio_path", None)

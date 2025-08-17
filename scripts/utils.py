@@ -2,6 +2,7 @@
 # -------------------------------------------------------
 # Utility: chunking testo + IMMAGINI (Replicate) + AUDIO (FishAudio)
 # Compatibile con Python 3.13: niente pydub; mutagen per durate, imageio-ffmpeg per concat.
+# VERSIONE CORRETTA - Chunking audio migliorato + gestione errori 404
 # -------------------------------------------------------
 
 import os
@@ -16,7 +17,6 @@ from PIL import Image
 
 # ============== Chunking ==============
 def chunk_text(text: str, max_chars: int):
-    """Divide text in blocchi di max_chars, spezzando tra le parole."""
     words = (text or "").split()
     parts, curr, length = [], [], 0
     for w in words:
@@ -30,9 +30,7 @@ def chunk_text(text: str, max_chars: int):
         parts.append(" ".join(curr))
     return parts
 
-
 def chunk_by_sentence(text: str, max_chars: int):
-    """Divide il testo in blocchi di max_chars, spezzando sempre a fine frase (.?!)."""
     sentences = re.split(r'(?<=[.?!])\s+', (text or "").strip())
     parts, curr = [], ""
     for sent in sentences:
@@ -47,12 +45,64 @@ def chunk_by_sentence(text: str, max_chars: int):
         parts.append(curr)
     return parts
 
-
 def chunk_by_sentences_count(text: str, sentences_per_chunk: int):
-    """Divide il testo in blocchi di N frasi."""
     sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', (text or "").strip()) if s.strip()]
     N = max(1, int(sentences_per_chunk or 1))
     return [" ".join(sentences[i:i + N]) for i in range(0, len(sentences), N)]
+
+# NUOVO: Chunking specifico per audio - mantiene circa 2000 caratteri
+def chunk_text_for_audio(text: str, target_chars: int = 2000):
+    """
+    Chunking specifico per audio - mantiene frasi complete e mira a ~2000 caratteri
+    """
+    if not text or len(text) <= target_chars:
+        return [text] if text else []
+    
+    # Dividi per frasi
+    sentences = re.split(r'(?<=[.?!])\s+', text.strip())
+    
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        # Test se aggiungendo questa frase supero il target
+        test_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
+        
+        if len(test_chunk) <= target_chars:
+            current_chunk = test_chunk
+        else:
+            # Se la frase corrente è troppo lunga da sola, spezzala
+            if len(sentence) > target_chars:
+                # Salva chunk corrente se non vuoto
+                if current_chunk:
+                    chunks.append(current_chunk)
+                    current_chunk = ""
+                
+                # Spezza la frase lunga per parole
+                words = sentence.split()
+                temp_chunk = ""
+                for word in words:
+                    test_word_chunk = (temp_chunk + " " + word).strip() if temp_chunk else word
+                    if len(test_word_chunk) <= target_chars:
+                        temp_chunk = test_word_chunk
+                    else:
+                        if temp_chunk:
+                            chunks.append(temp_chunk)
+                        temp_chunk = word
+                
+                if temp_chunk:
+                    current_chunk = temp_chunk
+            else:
+                # Salva chunk corrente e inizia nuovo
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = sentence
+    
+    # Aggiungi ultimo chunk
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks
 
 # ============== Streamlit helper ==============
 def _st():
@@ -63,7 +113,7 @@ def _st():
         return None
 
 # ============== Immagini ==============
-def save_image_from_url(url: str, path: str, timeout: int = 30):
+def save_image_from_url(url: str, path: str, timeout: int = 60):  # AUMENTATO timeout
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
     img = Image.open(BytesIO(r.content))
@@ -81,12 +131,7 @@ def _download_first(urls, dest_path: str):
 def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float = 11.0):
     """
     Genera 1 immagine per ogni elemento di `chunks` usando Replicate.
-
-    Config letta da:
-      - API: cfg['replicate_api_token'] | cfg['replicate_api_key'] | env REPLICATE_API_TOKEN
-      - Modello: cfg['image_model'] | cfg['replicate_model']
-      - Extra input: cfg['replicate_input'] (dict, opzionale)
-      - aspect_ratio default: cfg['aspect_ratio'] o '16:9'
+    VERSIONE CORRETTA con gestione errori 404 migliorata
     """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
@@ -108,18 +153,50 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
         if st: st.error("❌ " + msg)
         raise ValueError(msg)
 
+    # NORMALIZZA IL NOME DEL MODELLO
+    if ":" not in model:
+        model = f"{model}:latest"
+        if st: st.info(f"🔧 Aggiunto tag :latest → `{model}`")
+
     import replicate
     client = replicate.Client(api_token=api_key)
 
+    # VERIFICA PRELIMINARE DEL MODELLO
+    try:
+        owner, name_version = model.split("/", 1)
+        name, version = name_version.split(":", 1) if ":" in name_version else (name_version, "latest")
+        
+        # Test call per verificare esistenza
+        resp = requests.get(
+            f"https://api.replicate.com/v1/models/{owner}/{name}",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10
+        )
+        
+        if resp.status_code == 404:
+            if st:
+                st.error(f"❌ MODELLO NON TROVATO: `{model}`")
+                st.markdown("### 🔄 SOLUZIONI:")
+                st.markdown("1. **Verifica il nome** - Controlla su replicate.com")
+                st.markdown("2. **Prova un modello alternativo:**")
+                st.code("black-forest-labs/flux-schnell")
+                st.code("stability-ai/stable-diffusion-xl-base-1.0")
+                st.markdown("3. **Controlla i permessi** del tuo account Replicate")
+            raise ValueError(f"Modello '{model}' non trovato (404). Verifica il nome su replicate.com")
+        
+    except requests.exceptions.RequestException as e:
+        if st: st.warning(f"⚠️ Impossibile verificare modello: {e} - Procedendo...")
+
     masked = (api_key[:3] + "…" + api_key[-4:]) if len(api_key) > 8 else "—"
     if st:
-        st.write(f"🔐 Token Replicate in uso: {masked}")
-        st.write(f"🧩 Modello Replicate: `{model}`")
+        st.write(f"🔐 Token: {masked}")
+        st.write(f"🧩 Modello: `{model}`")
     else:
-        print(f"[INFO] Replicate token: {masked}")
-        print(f"[INFO] Using Replicate model: {model}")
+        print(f"[INFO] Token: {masked}, Model: {model}")
 
     results = []
+    failed_chunks = []
+    
     for idx, prompt in enumerate(chunks, start=1):
         model_input = {"prompt": prompt}
         model_input.setdefault("aspect_ratio", (cfg or {}).get("aspect_ratio", "16:9"))
@@ -127,6 +204,8 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
             model_input.update(extra_input)
 
         try:
+            if st: st.write(f"🎨 Generando immagine {idx}/{len(chunks)}...")
+            
             output = client.run(model, input=model_input)
 
             urls = []
@@ -151,24 +230,44 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
             else:
                 print(f"[OK] Saved {outpath}")
 
+        except replicate.exceptions.ReplicateError as e:
+            error_msg = str(e)
+            if "404" in error_msg:
+                if st:
+                    st.error(f"❌ MODELLO INESISTENTE: `{model}`")
+                    st.markdown("### 🆘 AZIONE RICHIESTA:")
+                    st.markdown("1. Vai su **replicate.com** e cerca un modello funzionante")
+                    st.markdown("2. Copia il nome esatto (es: `owner/model-name:version`)")
+                    st.markdown("3. Incollalo nel campo 'Custom model' nella sidebar")
+                raise ValueError(f"Modello '{model}' non trovato. Vai su replicate.com per trovare modelli disponibili.")
+            else:
+                failed_chunks.append(idx)
+                if st: st.error(f"❌ Errore Replicate chunk {idx}: {error_msg}")
+                else: print(f"[ERROR] Replicate chunk {idx}: {error_msg}")
+                
         except Exception as e:
-            try:
-                ReplicateError = replicate.exceptions.ReplicateError
-            except Exception:
-                ReplicateError = Exception
-            msg = f"ReplicateError su chunk {idx}: {e}" if isinstance(e, ReplicateError) else f"Errore su chunk {idx}: {e}"
-            if st: st.error("❌ " + msg)
-            else: print("[ERROR]", msg)
-            raise
+            failed_chunks.append(idx)
+            if st: st.error(f"❌ Errore generico chunk {idx}: {e}")
+            else: print(f"[ERROR] Generic chunk {idx}: {e}")
 
         if sleep_between_calls and idx < len(chunks):
             time.sleep(sleep_between_calls)
+
+    # REPORT FINALE
+    if failed_chunks:
+        if st:
+            st.warning(f"⚠️ {len(failed_chunks)} immagini fallite su {len(chunks)} totali")
+            st.write(f"Chunks falliti: {failed_chunks}")
+        else:
+            print(f"[WARNING] {len(failed_chunks)} failed chunks: {failed_chunks}")
+    
+    if not results:
+        raise RuntimeError("Nessuna immagine generata con successo. Controlla modello e API key.")
 
     return results
 
 # ============== Audio (FishAudio) senza pydub ==============
 
-# Durata MP3
 def mp3_duration_seconds(path: str) -> float:
     """Ritorna la durata in secondi usando mutagen."""
     try:
@@ -177,26 +276,43 @@ def mp3_duration_seconds(path: str) -> float:
     except Exception:
         return 0.0
 
-# Concatenazione MP3 con ffmpeg (portabile via imageio-ffmpeg)
 def concat_mp3s(paths, out_path: str, bitrate_kbps: int = 128):
     """
-    Concatena MP3 usando ffmpeg. Ricodifica a libmp3lame per robustezza.
+    Concatena MP3 usando ffmpeg (imageio-ffmpeg). Ricodifica a libmp3lame.
+    VERSIONE CORRETTA con fallback alternativo
     """
     if not paths:
         raise RuntimeError("Nessun file MP3 da concatenare.")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # Prova multiple fonti per FFmpeg
+    ffmpeg_bin = None
+    
+    # 1. Prova imageio-ffmpeg
+    try:
+        import imageio_ffmpeg
+        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        print(f"[DEBUG] Using imageio-ffmpeg: {ffmpeg_bin}")
+    except Exception as e:
+        print(f"[DEBUG] imageio-ffmpeg failed: {e}")
+    
+    # 2. Prova ffmpeg system
+    if not ffmpeg_bin:
+        import shutil
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin:
+            print(f"[DEBUG] Using system ffmpeg: {ffmpeg_bin}")
+    
+    # 3. Fallback alternativo senza ffmpeg
+    if not ffmpeg_bin:
+        print("[WARNING] FFmpeg not found, using alternative method")
+        return _concat_mp3s_alternative(paths, out_path)
 
     list_path = out_path + ".txt"
     with open(list_path, "w", encoding="utf-8") as f:
         for p in paths:
             abspath = os.path.abspath(p)
             f.write(f"file '{abspath}'\n")
-
-    try:
-        import imageio_ffmpeg
-        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        ffmpeg_bin = "ffmpeg"  # fallback a sistema
 
     cmd = [
         ffmpeg_bin,
@@ -211,13 +327,35 @@ def concat_mp3s(paths, out_path: str, bitrate_kbps: int = 128):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg concat failed: {proc.stderr.decode(errors='ignore')[:500]}")
-
     try:
         os.remove(list_path)
     except Exception:
         pass
 
-def _download_with_retry(url: str, retries: int = 3, timeout: int = 30) -> bytes:
+def _concat_mp3s_alternative(paths, out_path: str):
+    """Fallback: concatena usando solo Python quando FFmpeg non disponibile"""
+    print("[INFO] Using Python-only MP3 concat (no ffmpeg)")
+    
+    with open(out_path, 'wb') as outfile:
+        for i, path in enumerate(paths):
+            with open(path, 'rb') as infile:
+                if i == 0:
+                    # Primo file: copia tutto
+                    outfile.write(infile.read())
+                else:
+                    # File successivi: salta header MP3 (approssimativo)
+                    data = infile.read()
+                    # Cerca sync frame MP3 (0xFF FB o 0xFF FA)
+                    for j in range(min(1000, len(data) - 1)):
+                        if data[j] == 0xFF and (data[j+1] & 0xE0) == 0xE0:
+                            outfile.write(data[j:])
+                            break
+                    else:
+                        # Fallback: scrivi tutto
+                        outfile.write(data)
+    return out_path
+
+def _download_with_retry(url: str, retries: int = 5, timeout: int = 60) -> bytes:  # AUMENTATI retry e timeout
     last_exc = None
     for _ in range(max(1, retries)):
         try:
@@ -233,12 +371,7 @@ def generate_audio(chunks, cfg: dict, outdir: str,
                    tts_endpoint: str = "https://api.fish.audio/v1/tts"):
     """
     Genera audio da ogni blocco di testo in `chunks` con FishAudio e li concatena.
-
-    Config:
-      - cfg['fishaudio_api_key']               (obbligatoria)
-      - cfg['fishaudio_voice'] | cfg['fishaudio_voice_id']   (obbligatoria)
-      - cfg['fishaudio_model']                 (opzionale)
-      - cfg['fishaudio_extra']                 (dict opzionale; es. format/bitrate)
+    VERSIONE CORRETTA con logging chunking e timeout migliorati
     """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
@@ -257,15 +390,20 @@ def generate_audio(chunks, cfg: dict, outdir: str,
         if st: st.error("❌ " + msg)
         raise ValueError(msg)
 
+    # LOG CHUNKING INFO
+    if st:
+        total_chars = sum(len(chunk) for chunk in chunks)
+        avg_chars = total_chars / len(chunks) if chunks else 0
+        st.write(f"📊 Audio chunking: {len(chunks)} segmenti | Totale: {total_chars} char | Media: {avg_chars:.0f} char/segmento")
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     if model:
-        headers["model"] = model  # compat con tuo codice precedente
+        headers["model"] = model
 
     audio_paths = []
-    last_error = None
 
     for i, text in enumerate(chunks, 1):
         if st:
@@ -285,24 +423,27 @@ def generate_audio(chunks, cfg: dict, outdir: str,
             payload.update(extra)
 
         try:
-            resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=90)
+            resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=120)  # AUMENTATO timeout
             if resp.status_code >= 400:
-                # log esteso per capire perché non genera
-                try_text = resp.text[:500]
-                raise RuntimeError(f"HTTP {resp.status_code} FishAudio: {try_text}")
+                detail = resp.text[:500]
+                if st: st.error(f"❌ HTTP {resp.status_code} FishAudio: {detail}")
+                else: print(f"HTTP {resp.status_code} FishAudio: {detail}")
+                # passa al prossimo chunk senza interrompere tutto
+                continue
 
             ct = resp.headers.get("Content-Type", "")
             if "application/json" in ct:
                 data = resp.json()
-                # supporto anche base64 se l'API la fornisse
                 audio_url = data.get("audio_url") or data.get("url")
                 audio_b64 = data.get("audio_base64") or data.get("audio")
                 if audio_url:
-                    audio_bytes = _download_with_retry(audio_url, retries=3, timeout=60)
+                    audio_bytes = _download_with_retry(audio_url, retries=5, timeout=60)
                 elif audio_b64:
                     audio_bytes = base64.b64decode(audio_b64)
                 else:
-                    raise RuntimeError(f"Risposta JSON inattesa: {data}")
+                    if st: st.error(f"❌ Risposta JSON inattesa: {data}")
+                    else: print(f"JSON inatteso: {data}")
+                    continue
             else:
                 audio_bytes = resp.content
 
@@ -319,29 +460,22 @@ def generate_audio(chunks, cfg: dict, outdir: str,
             audio_paths.append(path)
 
         except Exception as e:
-            last_error = e
-            msg = f"Errore TTS sul chunk {i}: {e}"
-            if st: st.error("❌ " + msg)
-            else: print("❌", msg)
-            # continua coi chunk successivi
+            if st: st.error(f"❌ Errore TTS sul chunk {i}: {e}")
+            else: print("❌", f"Errore TTS sul chunk {i}: {e}")
+            continue
 
     if not audio_paths:
-        # non mandiamo eccezione dura: lasciamo all'app decidere
-        if st:
-            st.error("Nessun audio generato: verifica API key, Voice ID e Model in sidebar.")
-        else:
-            print("Nessun audio generato.")
+        # Non alziamo eccezione dura: l'app gestisce e mostra messaggio
         return None
 
     out_path = os.path.join(outdir, "combined_audio.mp3")
     concat_mp3s(audio_paths, out_path, bitrate_kbps=128)
 
-    total_ms = int(mp3_duration_seconds(out_path) * 1000)
     if st:
-        st.write(f"🔊 Durata totale audio: {total_ms} ms")
+        st.write(f"🔊 Durata totale audio: {int(mp3_duration_seconds(out_path)*1000)} ms")
         st.success("🔊 Audio finale creato.")
     else:
-        print(f"[TTS] combined duration: {total_ms} ms")
+        print(f"[TTS] combined length: {mp3_duration_seconds(out_path):.2f}s")
         print("🔊 Audio finale creato.")
 
     return out_path

@@ -2,14 +2,14 @@
 # -------------------------------------------------------
 # Streamlit app: genera IMMAGINI / AUDIO con Replicate + FishAudio.
 # Compatibile con Python 3.13: niente pydub; ffmpeg via imageio-ffmpeg lato utils.
-# VERSIONE con TIMELINE, CHECKPOINT e RESUME ROBUSTI
+# VERSIONE con TIMELINE, CHECKPOINT e RESUME ROBUSTI + ANTI-STALLO
 # (Compatibile con utils.py vecchio o nuovo tramite wrapper)
 # -------------------------------------------------------
 
 import os
 import re
-import time
 import json
+import time
 import requests
 from datetime import datetime
 import streamlit as st
@@ -28,15 +28,13 @@ from scripts.utils import (
     generate_audio,
     generate_images,
     mp3_duration_seconds,   # util per leggere durata MP3
-    # se non esistono nel tuo utils vecchio, non fa nulla; le chiamate ai wrapper non li richiedono
-    # ma se li hai, verranno usati (consigliato)
 )
 
 # Proviamo a importare load_checkpoint/save_checkpoint se esistono (nuova versione)
 try:
     from scripts.utils import load_checkpoint, save_checkpoint
 except Exception:
-    # fallback: versioni minime no-op per evitare crash se il tuo utils è vecchio
+    # fallback minimi per non rompere se il tuo utils è vecchio
     def load_checkpoint(base_dir: str):
         try:
             path = os.path.join(base_dir, "checkpoint.json")
@@ -168,7 +166,7 @@ def display_timeline(tracker: ProgressTracker, container):
             st.metric("📊 Totale Stimato", f"{total_estimate:.1f} min")
         with col4:
             completed = len([s for s in tracker.steps if s["status"] == "completed"])
-            st.metric("✅ Completati", f"{completed}/{len(tracker.steps)}")
+            st.metric("✅ Completati", f"{completed}/{len(self.steps)}")
 
         progress = tracker.get_completion_percentage() / 100
         st.progress(progress, text=f"Progresso generale: {progress*100:.1f}%")
@@ -202,7 +200,7 @@ def display_timeline(tracker: ProgressTracker, container):
                     st.markdown(f"   └ {substep_icon} {substep['description']}")
 
 # ---------------------------
-# Utility Functions
+# Utility / Lock Helpers
 # ---------------------------
 
 def sanitize(title: str) -> str:
@@ -264,12 +262,67 @@ def validate_replicate_model(model_name: str, api_key: str) -> bool:
         st.error(f"❌ Errore validazione modello: {e}")
         return False
 
+# ---- LOCK SYSTEM (anti-stallo) ----
+GEN_TIMEOUT_SECS = 10 * 60  # 10 minuti; regola a piacere
+
+def _lock_path(base_dir: str) -> str:
+    return os.path.join(base_dir, ".generation.lock")
+
+def write_lock(base_dir: str):
+    os.makedirs(base_dir, exist_ok=True)
+    data = {"start_ts": time.time(), "last_progress_ts": time.time()}
+    with open(_lock_path(base_dir), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+def touch_progress(base_dir: str):
+    try:
+        path = _lock_path(base_dir)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = {"start_ts": time.time()}
+        data["last_progress_ts"] = time.time()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def is_lock_stale(base_dir: str, timeout_secs: int = GEN_TIMEOUT_SECS) -> bool:
+    path = _lock_path(base_dir)
+    try:
+        if not os.path.exists(path):
+            return False
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        last = float(data.get("last_progress_ts") or data.get("start_ts") or 0.0)
+        return (time.time() - last) > timeout_secs
+    except Exception:
+        # se non riesco a leggere, considero stantio
+        return True
+
+def clear_lock(base_dir: str):
+    try:
+        os.remove(_lock_path(base_dir))
+    except Exception:
+        pass
+
 # ---------------------------
 # Streamlit App Setup
 # ---------------------------
 
 st.set_page_config(page_title="Generatore Video", page_icon="🎬", layout="wide")
 st.title("🎬 Generatore di Video con Immagini e Audio")
+
+# Se la sessione risulta "in corso", prova a sbloccare se il lock è stantio
+if st.session_state.get("is_generating", False):
+    t = st.session_state.get("title", "")
+    if t:
+        base_check = os.path.join("data", "outputs", sanitize(t))
+        if is_lock_stale(base_check):
+            clear_lock(base_check)
+            st.session_state["is_generating"] = False
+            st.info("🔧 Sessione precedente risultava bloccata: sbloccata automaticamente.")
 
 # Carica config opzionale
 base_cfg = {}
@@ -409,33 +462,47 @@ with st.sidebar:
         st.session_state["chunk_size"] = 2000
         st.session_state["sleep_time"] = 11
 
-    # Gestione Resume/Checkpoint
+    # Gestione Resume/Checkpoint e Sblocco
     st.divider()
-    st.subheader("🔄 Gestione Resume")
-    if st.button("🗑️ Pulisci tutti i checkpoint", help="Rimuove tutti i lavori salvati", key="clear_checkpoints_btn"):
-        import glob
-        removed = 0
-        data_dir = "data/outputs"
-        if os.path.exists(data_dir):
-            checkpoints = glob.glob(os.path.join(data_dir, "*/checkpoint.json"))
-            for cp in checkpoints:
-                try:
-                    os.remove(cp)
-                    removed += 1
-                except Exception:
-                    pass
-        st.success(f"🗑️ Rimossi {removed} checkpoint" if removed else "ℹ️ Nessun checkpoint trovato")
+    st.header("🔄 Resume & Sblocco")
+
+    # Bottone sblocco per il titolo corrente
+    if st.button("🔓 Sblocca generazione bloccata (titolo corrente)"):
+        t = st.session_state.get("title", "")
+        if t:
+            base_unlock = os.path.join("data", "outputs", sanitize(t))
+            clear_lock(base_unlock)
+        st.session_state["is_generating"] = False
+        st.success("Sblocco eseguito. Puoi riprendere la generazione.")
+        st.rerun()
+
+    # Bottone sblocco globale (tutti i lock)
+    if st.button("🧹 Sblocca tutti i progetti bloccati"):
+        base_root = "data/outputs"
+        cleared = 0
+        if os.path.exists(base_root):
+            for name in os.listdir(base_root):
+                p = os.path.join(base_root, name, ".generation.lock")
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                        cleared += 1
+                    except Exception:
+                        pass
+        st.session_state["is_generating"] = False
+        st.success(f"Sbloccati {cleared} progetti.")
+        st.rerun()
 
     # Mostra checkpoint esistenti
     data_dir = "data/outputs"
     if os.path.exists(data_dir):
         import glob
         checkpoints = glob.glob(os.path.join(data_dir, "*/checkpoint.json"))
-        if checklists := checkpoints:
-            st.write(f"📁 Checkpoint attivi: {len(checklists)}")
+        if checkpoints:
+            st.write(f"📁 Checkpoint attivi: {len(checkpoints)}")
             with st.expander("Dettagli checkpoint"):
                 shown = 0
-                for cp in checklists:
+                for cp in checkpoints:
                     if shown >= 5:
                         st.caption("…")
                         break
@@ -535,107 +602,98 @@ with col_timeline:
             st.info("⏳ Premi 'Genera contenuti' per iniziare la timeline")
 
 # ===========================
-# 🚀 Avvio generazione
+# 🚀 Avvio generazione (con anti-stallo)
 # ===========================
 if generate and title.strip() and script.strip():
+    # Se un'altra sessione è rimasta appesa ma lo stop è vecchio, sblocca
     if st.session_state.get("is_generating", False):
-        st.warning("⏳ Generazione già in corso...")
-        st.stop()
+        # se ho il titolo corrente, controllo lock
+        base_try = os.path.join("data", "outputs", sanitize(st.session_state.get("title","")))
+        if base_try and is_lock_stale(base_try):
+            clear_lock(base_try)
+            st.session_state["is_generating"] = False
+        else:
+            st.warning("⏳ Generazione già in corso...")
+            st.stop()
 
+    # --- Setup e CONTROLLI PRIMA del flag ---
+    safe = sanitize(title)
+    base = os.path.join("data", "outputs", safe)
+    img_dir = os.path.join(base, "images")
+    aud_dir = os.path.join(base, "audio")
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(aud_dir, exist_ok=True)
+    audio_path = os.path.join(aud_dir, "combined_audio.mp3")
+
+    runtime_cfg = dict(base_cfg)
+    replicate_from_ui = _clean_token(get_replicate_key())
+    fishaudio_from_ui = _clean_token(get_fishaudio_key())
+    replicate_model  = get_replicate_model()
+    fish_voice       = get_fishaudio_voice_id()
+
+    # prerequisiti
+    if mode in ["Audio", "Entrambi"]:
+        if not fishaudio_from_ui:
+            st.error("❌ FishAudio API key mancante!")
+            st.stop()
+        if not fish_voice:
+            st.error("❌ FishAudio Voice ID mancante!")
+            st.stop()
+    if mode in ["Immagini", "Entrambi"]:
+        if not replicate_from_ui:
+            st.error("❌ Replicate API key mancante!")
+            st.stop()
+        if not replicate_model:
+            st.error("❌ Modello Replicate mancante!")
+            st.stop()
+
+    # Config in env
+    if replicate_from_ui:
+        os.environ["REPLICATE_API_TOKEN"] = replicate_from_ui
+        runtime_cfg["replicate_api_key"] = replicate_from_ui
+        runtime_cfg["replicate_api_token"] = replicate_from_ui
+    if fishaudio_from_ui:
+        os.environ["FISHAUDIO_API_KEY"] = fishaudio_from_ui
+        runtime_cfg["fishaudio_api_key"] = fishaudio_from_ui
+    if replicate_model:
+        runtime_cfg["replicate_model"] = replicate_model
+    if fish_voice:
+        runtime_cfg["fishaudio_voice_id"] = fish_voice
+    runtime_cfg["chunk_size"] = st.session_state.get("chunk_size", 2000)
+    runtime_cfg["sleep_time"] = st.session_state.get("sleep_time", 11.0)
+
+    # --- SOLO ORA attiva il flag e scrivi il lock ---
     st.session_state["is_generating"] = True
-    st.session_state["title"] = title  # per nomi file download
-    debug_container = st.container()
+    st.session_state["title"] = title
+    write_lock(base)
+
+    # avvia tracker
     tracker = ProgressTracker()
+    chunk_size = runtime_cfg["chunk_size"]
+    aud_chunks = chunk_text_for_audio(script, target_chars=chunk_size) if mode in ["Audio", "Entrambi"] else []
+
+    if mode == "Entrambi":
+        estimated_audio_duration = (len(script) / 5) / 150 * 60
+        estimated_images = max(1, int(estimated_audio_duration // st.session_state.get("seconds_per_img", 8)))
+    elif mode == "Immagini":
+        estimated_images = len(chunk_by_sentences_count(script, int(st.session_state.get("sentences_per_image", 2))))
+    else:
+        estimated_images = 0
+
+    tracker.start(len(aud_chunks), estimated_images)
+    display_timeline(tracker, timeline_container)
+    st.success(f"🎯 **Generazione Iniziata!** Stimati {len(aud_chunks)} chunk audio + {estimated_images} immagini")
+
+    # Progress callback per aggiornare timeline + lock
+    def _progress(msg: str):
+        touch_progress(base)
+        if tracker.current_step is not None:
+            tracker.add_substep(tracker.current_step, msg, "completed")
+            display_timeline(tracker, timeline_container)
+
+    debug_container = st.container()
 
     try:
-        with debug_container:
-            st.write("🔍 **DEBUG**: Inizializzazione...")
-
-        # Setup directories
-        safe = sanitize(title)
-        base = os.path.join("data", "outputs", safe)
-        img_dir = os.path.join(base, "images")
-        aud_dir = os.path.join(base, "audio")
-        os.makedirs(img_dir, exist_ok=True)
-        os.makedirs(aud_dir, exist_ok=True)
-        audio_path = os.path.join(aud_dir, "combined_audio.mp3")
-
-        with debug_container:
-            st.write(f"📁 Directory create: {base}")
-
-        # Config runtime
-        runtime_cfg = dict(base_cfg)
-        replicate_from_ui = _clean_token(get_replicate_key())
-        fishaudio_from_ui = _clean_token(get_fishaudio_key())
-
-        if replicate_from_ui:
-            os.environ["REPLICATE_API_TOKEN"] = replicate_from_ui
-            runtime_cfg["replicate_api_key"] = replicate_from_ui
-            runtime_cfg["replicate_api_token"] = replicate_from_ui
-        if fishaudio_from_ui:
-            os.environ["FISHAUDIO_API_KEY"] = fishaudio_from_ui
-            runtime_cfg["fishaudio_api_key"] = fishaudio_from_ui
-
-        replicate_model = get_replicate_model()
-        if replicate_model:
-            runtime_cfg["replicate_model"] = replicate_model
-        fish_voice = get_fishaudio_voice_id()
-        if fish_voice:
-            runtime_cfg["fishaudio_voice_id"] = fish_voice
-
-        runtime_cfg["chunk_size"] = get_chunk_size()
-        runtime_cfg["sleep_time"] = get_sleep_time()
-
-        with debug_container:
-            st.write(f"⚙️ Config - Chunk: {get_chunk_size()} | Sleep: {get_sleep_time()}s | Model: {replicate_model or 'N/A'} | Voice: {fish_voice or 'N/A'}")
-
-        # Calcola stime per tracker
-        chunk_size = get_chunk_size()
-        with debug_container:
-            st.write(f"📝 Chunking script di {len(script)} caratteri...")
-
-        aud_chunks = chunk_text_for_audio(script, target_chars=chunk_size) if mode in ["Audio", "Entrambi"] else []
-        with debug_container:
-            st.write(f"🎧 Audio chunks creati: {len(aud_chunks)}")
-
-        if mode == "Entrambi":
-            estimated_audio_duration = (len(script) / 5) / 150 * 60
-            estimated_images = max(1, int(estimated_audio_duration // seconds_per_img))
-        elif mode == "Immagini":
-            estimated_images = len(chunk_by_sentences_count(script, int(sentences_per_image)))
-        else:
-            estimated_images = 0
-
-        with debug_container:
-            st.write(f"🖼️ Immagini stimate: {estimated_images}")
-
-        # Verifica prerequisiti
-        if mode in ["Audio", "Entrambi"]:
-            if not fishaudio_from_ui:
-                st.error("❌ FishAudio API key mancante!")
-                st.stop()
-            if not fish_voice:
-                st.error("❌ FishAudio Voice ID mancante!")
-                st.stop()
-        if mode in ["Immagini", "Entrambi"]:
-            if not replicate_from_ui:
-                st.error("❌ Replicate API key mancante!")
-                st.stop()
-            if not replicate_model:
-                st.error("❌ Modello Replicate mancante!")
-                st.stop()
-
-        # Inizializza tracker
-        tracker.start(len(aud_chunks), estimated_images)
-        display_timeline(tracker, timeline_container)
-        st.success(f"🎯 **Generazione Iniziata!** Stimati {len(aud_chunks)} chunk audio + {estimated_images} immagini")
-
-        # Progress callback per aggiornare timeline
-        def _progress(msg: str):
-            if tracker.current_step is not None:
-                tracker.add_substep(tracker.current_step, msg, "completed")
-                display_timeline(tracker, timeline_container)
-
         # ---- AUDIO ----
         if mode in ["Audio", "Entrambi"]:
             with debug_container:
@@ -645,28 +703,19 @@ if generate and title.strip() and script.strip():
             tracker.add_substep(step_idx, f"📝 Creati {len(aud_chunks)} chunk da ~{chunk_size} caratteri", "completed")
             display_timeline(tracker, timeline_container)
 
-            try:
-                final_audio = _call_generate_audio(aud_chunks, runtime_cfg, aud_dir, _progress)
-                if final_audio and os.path.exists(final_audio):
-                    audio_path = final_audio
-                    duration = mp3_duration_seconds(audio_path)
-                    tracker.complete_step(step_idx, "completed")
-                    tracker.steps[step_idx]["description"] = f"🎵 Audio Completato ({duration:.1f}s = {duration/60:.1f}min)"
-                    tracker.add_substep(step_idx, f"🔊 Audio finale: {duration:.1f}s", "completed")
-                    with debug_container:
-                        st.write(f"✅ Audio completato: {final_audio}")
-                else:
-                    tracker.complete_step(step_idx, "failed")
-                    tracker.add_substep(step_idx, "❌ Generazione audio fallita", "failed")
-                    display_timeline(tracker, timeline_container)
-                    st.error("⚠️ Audio non generato: controlla API key/voice/model nella sidebar.")
-                    st.stop()
-            except Exception as audio_error:
-                with debug_container:
-                    st.error(f"❌ ERRORE AUDIO: {audio_error}")
+            final_audio = _call_generate_audio(aud_chunks, runtime_cfg, aud_dir, _progress)
+            if final_audio and os.path.exists(final_audio):
+                audio_path = final_audio
+                duration = mp3_duration_seconds(audio_path)
+                tracker.complete_step(step_idx, "completed")
+                tracker.steps[step_idx]["description"] = f"🎵 Audio Completato ({duration:.1f}s = {duration/60:.1f}min)"
+                tracker.add_substep(step_idx, f"🔊 Audio finale: {duration:.1f}s", "completed")
+            else:
                 tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, f"❌ Errore: {str(audio_error)[:80]}", "failed")
-                raise
+                tracker.add_substep(step_idx, "❌ Generazione audio fallita", "failed")
+                display_timeline(tracker, timeline_container)
+                st.error("⚠️ Audio non generato.")
+                st.stop()
 
             display_timeline(tracker, timeline_container)
 
@@ -680,59 +729,46 @@ if generate and title.strip() and script.strip():
                 step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini ({estimated_images} immagini)")
             display_timeline(tracker, timeline_container)
 
-            try:
-                if mode == "Entrambi":
-                    if not os.path.exists(audio_path):
-                        tracker.complete_step(step_idx, "failed")
-                        tracker.add_substep(step_idx, "❌ Audio non trovato", "failed")
-                        display_timeline(tracker, timeline_container)
-                        st.error("❌ Audio non trovato per calcolare le immagini.")
-                        st.stop()
-                    duration_sec = mp3_duration_seconds(audio_path) or 60
-                    num_images = max(1, int(duration_sec // seconds_per_img))
-                    tracker.add_substep(step_idx, f"📊 Audio {duration_sec:.1f}s → {num_images} immagini", "completed")
-
-                    if num_images == 1:
-                        img_chunks = [script]
-                    else:
-                        sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', script.strip()) if s.strip()]
-                        sentences_per_image_calc = max(1, len(sentences) // num_images)
-                        img_chunks = []
-                        for i in range(0, len(sentences), sentences_per_image_calc):
-                            chunk_sentences = sentences[i:i + sentences_per_image_calc]
-                            img_chunks.append(" ".join(chunk_sentences))
-
-                    tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(img_chunks)} Immagini"
+            if mode == "Entrambi":
+                if not os.path.exists(audio_path):
+                    tracker.complete_step(step_idx, "failed")
+                    tracker.add_substep(step_idx, "❌ Audio non trovato", "failed")
                     display_timeline(tracker, timeline_container)
+                    st.error("❌ Audio non trovato per calcolare le immagini.")
+                    st.stop()
 
-                    _call_generate_images(img_chunks, runtime_cfg, img_dir, _progress)
-                    zip_images(base)
-                    tracker.complete_step(step_idx, "completed")
-                    with debug_container:
-                        st.write("✅ Immagini completate")
+                seconds_per_img = st.session_state.get("seconds_per_img", 8)
+                duration_sec = mp3_duration_seconds(audio_path) or 60
+                num_images = max(1, int(duration_sec // seconds_per_img))
+                tracker.add_substep(step_idx, f"📊 Audio {duration_sec:.1f}s → {num_images} immagini", "completed")
+
+                if num_images == 1:
+                    img_chunks = [script]
                 else:
-                    groups = chunk_by_sentences_count(script, int(sentences_per_image))
-                    tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi di {int(sentences_per_image)} frasi", "completed")
-                    tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
-                    display_timeline(tracker, timeline_container)
+                    sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', script.strip()) if s.strip()]
+                    sentences_per_image_calc = max(1, len(sentences) // num_images)
+                    img_chunks = []
+                    for i in range(0, len(sentences), sentences_per_image_calc):
+                        chunk_sentences = sentences[i:i + sentences_per_image_calc]
+                        img_chunks.append(" ".join(chunk_sentences))
 
-                    _call_generate_images(groups, runtime_cfg, img_dir, _progress)
-                    zip_images(base)
-                    tracker.complete_step(step_idx, "completed")
-                    with debug_container:
-                        st.write("✅ Immagini completate")
-            except Exception as images_error:
-                with debug_container:
-                    st.error(f"❌ ERRORE IMMAGINI: {images_error}")
-                tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, f"❌ Errore: {str(images_error)[:80]}", "failed")
-                raise
+                tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(img_chunks)} Immagini"
+                display_timeline(tracker, timeline_container)
+                _call_generate_images(img_chunks, runtime_cfg, img_dir, _progress)
+                zip_images(base)
+                tracker.complete_step(step_idx, "completed")
+            else:
+                groups = chunk_by_sentences_count(script, int(st.session_state.get("sentences_per_image", 2)))
+                tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi di {int(st.session_state.get('sentences_per_image', 2))} frasi", "completed")
+                tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
+                display_timeline(tracker, timeline_container)
+                _call_generate_images(groups, runtime_cfg, img_dir, _progress)
+                zip_images(base)
+                tracker.complete_step(step_idx, "completed")
 
             display_timeline(tracker, timeline_container)
 
         # Finalizzazione
-        with debug_container:
-            st.write("🎉 **Finalizzando...**")
         final_step = tracker.add_step("finalize", "🎉 Finalizzazione e Packaging")
         display_timeline(tracker, timeline_container)
 
@@ -758,7 +794,7 @@ if generate and title.strip() and script.strip():
         st.balloons()
         st.success(f"✅ **Generazione completata in {total_time/60:.1f} minuti!**")
 
-        # Summary dettagliato
+        # Summary
         with st.expander("📊 Statistiche Dettagliate", expanded=True):
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -773,7 +809,7 @@ if generate and title.strip() and script.strip():
                 if image_steps:
                     st.metric("🖼️ Tempo Immagini", f"{sum(s['duration'] for s in image_steps)/60:.1f} min")
             with col3:
-                if aud_chunks:
+                if mode in ["Audio", "Entrambi"]:
                     st.metric("🎵 Chunk Audio", len(aud_chunks))
                 if mode in ["Immagini", "Entrambi"]:
                     try:
@@ -785,25 +821,13 @@ if generate and title.strip() and script.strip():
                         pass
 
     except Exception as e:
-        with debug_container:
-            st.error(f"💥 **ERRORE PRINCIPALE**: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-
-        if 'tracker' in locals() and tracker.current_step is not None:
-            tracker.complete_step(tracker.current_step, "failed")
-            tracker.add_substep(tracker.current_step, f"❌ Errore: {str(e)[:100]}", "failed")
-            display_timeline(tracker, timeline_container)
-
-        st.error(f"❌ Errore durante generazione: {e}")
-        with st.expander("🔍 Dettagli Errore Completi", expanded=True):
-            import traceback
-            st.code(traceback.format_exc())
-
+        st.error(f"💥 **ERRORE PRINCIPALE**: {e}")
+        import traceback
+        st.code(traceback.format_exc())
     finally:
+        # sempre ripulisci lock e flag
+        clear_lock(base)
         st.session_state["is_generating"] = False
-        with debug_container:
-            st.write("🔚 **Generazione terminata, flag rimosso**")
 
 # ===========================
 # 📥 DOWNLOAD SECTION (Sempre visibile)
@@ -828,7 +852,7 @@ with download_col1:
                 - Dimensione: {size_mb:.1f} MB
                 - Bitrate: ~{bitrate:.0f} kbps
                 """)
-            except:
+            except Exception:
                 st.info("📊 File audio disponibile")
             with open(audio_path, "rb") as f:
                 st.download_button(
@@ -863,7 +887,7 @@ with download_col2:
                 - Dimensione totale: {size_mb:.1f} MB
                 - Dimensione media: {avg_size_mb:.2f} MB/img
                 """)
-            except:
+            except Exception:
                 st.info("📊 ZIP immagini disponibile")
             with open(zip_path, "rb") as f:
                 st.download_button(
@@ -904,7 +928,7 @@ st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
     🎬 <strong>Generatore Video AI</strong> |
     Powered by Replicate + FishAudio |
-    Timeline real-time + Sistema Resume integrati
+    Timeline real-time + Sistema Resume + Anti-stallo
 </div>
 """, unsafe_allow_html=True)
 

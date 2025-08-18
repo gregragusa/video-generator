@@ -26,7 +26,6 @@ from scripts.utils import (
     generate_audio,
     generate_images,
     mp3_duration_seconds,  # util per leggere durata MP3
-    load_checkpoint,  # sistema resume
 )
 
 # ---------------------------
@@ -518,6 +517,7 @@ with col_main:
         
         # Controllo resume esistente
         if title.strip():
+            from scripts.utils import load_checkpoint
             safe = sanitize(title)
             base = os.path.join("data", "outputs", safe)
             checkpoint = load_checkpoint(base)

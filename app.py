@@ -981,3 +981,12 @@ st.markdown("""
     Timeline real-time + Sistema Resume integrati
 </div>
 """, unsafe_allow_html=True)
+# Dopo generazione audio
+with open(audio_output_path, "wb") as f:
+    f.write(audio_response.read())  # salva subito il file sul disco
+save_checkpoint(step="audio", data={"audio_output_path": audio_output_path})
+
+# Dopo generazione immagine
+with open(image_path, "wb") as f:
+    f.write(image_response.read())
+save_checkpoint(step="image", data={"image_path": image_path})

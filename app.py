@@ -1,27 +1,8 @@
-    # Ottimizzazioni velocità
-    st.divider()
-    st.subheader("⚡ Ottimizzazioni Velocità")
-    
-    speed_mode = st.selectbox("Modalità velocità", [
-        "🐌 Lenta ma sicura (default)",
-        "⚡ Veloce (raccomandato)", 
-        "🚀 Turbo (sperimentale)"
-    ])
-    
-    if speed_mode == "⚡ Veloce (raccomandato)":
-        st.session_state["chunk_size"] = 3500
-        st.session_state["sleep_time"] = 5
-    elif speed_mode == "🚀 Turbo (sperimentale)":
-        st.session_state["chunk_size"] = 5000
-        st.session_state["sleep_time"] = 2
-    else:  # Lenta ma sicura
-        st.session_state["chunk_size"] = 2000
-        st.session_state["sleep_time"] = 11
-        # app.py
+# app.py
 # -------------------------------------------------------
 # Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
 # Compatibile con Python 3.13: niente pydub; usiamo mutagen + ffmpeg via imageio-ffmpeg.
-# VERSIONE COMPLETA CON TIMELINE REAL-TIME
+# VERSIONE COMPLETA CON TIMELINE E SISTEMA RESUME
 # -------------------------------------------------------
 
 import os
@@ -45,6 +26,7 @@ from scripts.utils import (
     generate_audio,
     generate_images,
     mp3_duration_seconds,  # util per leggere durata MP3
+    load_checkpoint,  # sistema resume
 )
 
 # ---------------------------
@@ -424,6 +406,55 @@ with st.sidebar:
         st.session_state["chunk_size"] = 2000
         st.session_state["sleep_time"] = 11
 
+    # Gestione Resume/Checkpoint
+    st.divider()
+    st.subheader("🔄 Gestione Resume")
+    
+    if st.button("🗑️ Pulisci tutti i checkpoint", help="Rimuove tutti i lavori salvati", key="clear_checkpoints_btn"):
+        import shutil
+        data_dir = "data/outputs"
+        if os.path.exists(data_dir):
+            try:
+                # Rimuovi tutti i file checkpoint.json
+                import glob
+                checkpoints = glob.glob(os.path.join(data_dir, "*/checkpoint.json"))
+                removed = 0
+                for cp in checkpoints:
+                    try:
+                        os.remove(cp)
+                        removed += 1
+                    except Exception:
+                        pass
+                
+                if removed > 0:
+                    st.success(f"🗑️ Rimossi {removed} checkpoint")
+                else:
+                    st.info("ℹ️ Nessun checkpoint trovato")
+            except Exception as e:
+                st.error(f"❌ Errore: {e}")
+        else:
+            st.info("ℹ️ Nessuna directory output trovata")
+    
+    # Mostra checkpoint esistenti
+    data_dir = "data/outputs"
+    if os.path.exists(data_dir):
+        import glob
+        checkpoints = glob.glob(os.path.join(data_dir, "*/checkpoint.json"))
+        if checkpoints:
+            st.write(f"📁 Checkpoint attivi: {len(checkpoints)}")
+            with st.expander("Dettagli checkpoint"):
+                for cp in checkpoints[:5]:  # Mostra max 5
+                    try:
+                        import json
+                        with open(cp, 'r') as f:
+                            data = json.load(f)
+                        project_name = os.path.basename(os.path.dirname(cp))
+                        audio_progress = data.get('audio_completed', 0)
+                        images_progress = data.get('images_completed', 0)
+                        st.write(f"• **{project_name}**: Audio {audio_progress}, Immagini {images_progress}")
+                    except Exception:
+                        pass
+
 # Funzioni per recuperare stati
 def get_replicate_key() -> str:
     return (st.session_state.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN", "")).strip()
@@ -487,7 +518,6 @@ with col_main:
         
         # Controllo resume esistente
         if title.strip():
-            from scripts.utils import load_checkpoint
             safe = sanitize(title)
             base = os.path.join("data", "outputs", safe)
             checkpoint = load_checkpoint(base)
@@ -580,15 +610,10 @@ if generate and title.strip() and script.strip():
         # Inizializza tracker con stime
         tracker.start(len(aud_chunks), estimated_images)
         
-        # Passa tracker E display_timeline alle funzioni
-        runtime_cfg["progress_tracker"] = tracker
-        runtime_cfg["timeline_container"] = timeline_container
-        runtime_cfg["display_timeline_func"] = display_timeline
-
-        st.success(f"🎯 **Generazione Iniziata!** Stimati {len(aud_chunks)} chunk audio + {estimated_images} immagini")
-        
         # Display timeline iniziale
         display_timeline(tracker, timeline_container)
+
+        st.success(f"🎯 **Generazione Iniziata!** Stimati {len(aud_chunks)} chunk audio + {estimated_images} immagini")
 
         # ---- AUDIO ----
         if mode in ["Audio", "Entrambi"]:
@@ -869,6 +894,6 @@ st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
     🎬 <strong>Generatore Video AI</strong> | 
     Powered by Replicate + FishAudio | 
-    Timeline real-time integrata
+    Timeline real-time + Sistema Resume integrati
 </div>
 """, unsafe_allow_html=True)

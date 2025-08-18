@@ -166,7 +166,7 @@ def display_timeline(tracker: ProgressTracker, container):
             st.metric("📊 Totale Stimato", f"{total_estimate:.1f} min")
         with col4:
             completed = len([s for s in tracker.steps if s["status"] == "completed"])
-            st.metric("✅ Completati", f"{completed}/{len(self.steps)}")
+            st.metric("✅ Completati", f"{completed}/{len(tracker.steps)}")  # FIX corretto
 
         progress = tracker.get_completion_percentage() / 100
         st.progress(progress, text=f"Progresso generale: {progress*100:.1f}%")
@@ -563,11 +563,13 @@ with col_main:
             "Ogni quanti secondi di audio creare un'immagine?",
             min_value=1, value=8, step=1
         )
+        st.session_state["seconds_per_img"] = seconds_per_img
     else:  # Solo Immagini
         sentences_per_image = st.number_input(
             "Ogni quante frasi creare un'immagine?",
             min_value=1, value=2, step=1
         )
+        st.session_state["sentences_per_image"] = sentences_per_image
 
     # Info script con controllo resume
     if script:
@@ -607,7 +609,6 @@ with col_timeline:
 if generate and title.strip() and script.strip():
     # Se un'altra sessione è rimasta appesa ma lo stop è vecchio, sblocca
     if st.session_state.get("is_generating", False):
-        # se ho il titolo corrente, controllo lock
         base_try = os.path.join("data", "outputs", sanitize(st.session_state.get("title","")))
         if base_try and is_lock_stale(base_try):
             clear_lock(base_try)

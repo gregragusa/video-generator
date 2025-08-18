@@ -1,4 +1,23 @@
-# app.py
+    # Ottimizzazioni velocità
+    st.divider()
+    st.subheader("⚡ Ottimizzazioni Velocità")
+    
+    speed_mode = st.selectbox("Modalità velocità", [
+        "🐌 Lenta ma sicura (default)",
+        "⚡ Veloce (raccomandato)", 
+        "🚀 Turbo (sperimentale)"
+    ])
+    
+    if speed_mode == "⚡ Veloce (raccomandato)":
+        st.session_state["chunk_size"] = 3500
+        st.session_state["sleep_time"] = 5
+    elif speed_mode == "🚀 Turbo (sperimentale)":
+        st.session_state["chunk_size"] = 5000
+        st.session_state["sleep_time"] = 2
+    else:  # Lenta ma sicura
+        st.session_state["chunk_size"] = 2000
+        st.session_state["sleep_time"] = 11
+        # app.py
 # -------------------------------------------------------
 # Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
 # Compatibile con Python 3.13: niente pydub; usiamo mutagen + ffmpeg via imageio-ffmpeg.
@@ -461,14 +480,31 @@ with col_main:
             min_value=1, value=2, step=1
         )
 
-    # Info script
+    # Info script con controllo resume
     if script:
         char_count = len(script)
         word_count = len(script.split())
+        
+        # Controllo resume esistente
+        if title.strip():
+            from scripts.utils import load_checkpoint
+            safe = sanitize(title)
+            base = os.path.join("data", "outputs", safe)
+            checkpoint = load_checkpoint(base)
+            
+            if checkpoint:
+                st.warning(f"""
+                🔄 **LAVORO IN CORSO RILEVATO**
+                - Audio: {checkpoint.get('audio_completed', 0)} chunk completati
+                - Immagini: {checkpoint.get('images_completed', 0)} completate  
+                - Premi 'Genera' per **continuare da dove interrotto**
+                """)
+        
         st.info(f"📊 Script: {char_count:,} caratteri | {word_count:,} parole")
         
         if char_count > 100000:
             st.warning(f"⚠️ Script molto lungo! Generazione stimata: {char_count/10000:.1f}-{char_count/5000:.1f} minuti")
+            st.info("💡 **Tip**: Il sistema salva automaticamente i progressi. Se si interrompe, riavvia per continuare.")
 
     generate = st.button("🚀 Genera contenuti", type="primary", use_container_width=True, key="generate_btn")
 

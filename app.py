@@ -3,6 +3,7 @@
 # Streamlit app: genera IMMAGINI / AUDIO con Replicate + FishAudio.
 # Compatibile con Python 3.13: niente pydub; ffmpeg via imageio-ffmpeg lato utils.
 # VERSIONE con TIMELINE, CHECKPOINT e RESUME ROBUSTI
+# (Compatibile con utils.py vecchio o nuovo tramite wrapper)
 # -------------------------------------------------------
 
 import os
@@ -19,7 +20,7 @@ try:
 except Exception:
     load_config = None
 
-# Utils aggiornati (vedi canvas: contengono checkpoint atomici e resume idempotente)
+# Utils (funzionano sia vecchi che nuovi; i wrapper sotto gestiscono progress_cb)
 from scripts.utils import (
     chunk_text,
     chunk_by_sentences_count,
@@ -27,9 +28,55 @@ from scripts.utils import (
     generate_audio,
     generate_images,
     mp3_duration_seconds,   # util per leggere durata MP3
-    load_checkpoint,        # NEW
-    save_checkpoint,        # NEW
+    # se non esistono nel tuo utils vecchio, non fa nulla; le chiamate ai wrapper non li richiedono
+    # ma se li hai, verranno usati (consigliato)
 )
+
+# Proviamo a importare load_checkpoint/save_checkpoint se esistono (nuova versione)
+try:
+    from scripts.utils import load_checkpoint, save_checkpoint
+except Exception:
+    # fallback: versioni minime no-op per evitare crash se il tuo utils è vecchio
+    def load_checkpoint(base_dir: str):
+        try:
+            path = os.path.join(base_dir, "checkpoint.json")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+    def save_checkpoint(base_dir: str, updates: dict, merge: bool = True):
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+            path = os.path.join(base_dir, "checkpoint.json")
+            if merge and os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+            else:
+                state = {}
+            state.update(updates or {})
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+# ---- COMPAT WRAPPERS: accettano sia utils vecchi (senza progress_cb) che nuovi ----
+def _call_generate_audio(chunks, cfg, out_dir, progress_cb):
+    try:
+        # utils nuovo
+        return generate_audio(chunks, cfg, out_dir, progress_cb=progress_cb)
+    except TypeError:
+        # utils vecchio (senza progress_cb)
+        return generate_audio(chunks, cfg, out_dir)
+
+def _call_generate_images(chunks, cfg, out_dir, progress_cb):
+    try:
+        # utils nuovo
+        return generate_images(chunks, cfg, out_dir, progress_cb=progress_cb)
+    except TypeError:
+        # utils vecchio (senza progress_cb)
+        return generate_images(chunks, cfg, out_dir)
 
 # ---------------------------
 # Timeline Tracker System
@@ -496,6 +543,7 @@ if generate and title.strip() and script.strip():
         st.stop()
 
     st.session_state["is_generating"] = True
+    st.session_state["title"] = title  # per nomi file download
     debug_container = st.container()
     tracker = ProgressTracker()
 
@@ -551,8 +599,6 @@ if generate and title.strip() and script.strip():
             st.write(f"🎧 Audio chunks creati: {len(aud_chunks)}")
 
         if mode == "Entrambi":
-            # stima grossolana per il numero di immagini; poi lo ricalcoliamo sulla durata reale
-            estimated_audio_chars_per_sec = 5 * (150/150)  # approssimazione
             estimated_audio_duration = (len(script) / 5) / 150 * 60
             estimated_images = max(1, int(estimated_audio_duration // seconds_per_img))
         elif mode == "Immagini":
@@ -600,7 +646,7 @@ if generate and title.strip() and script.strip():
             display_timeline(tracker, timeline_container)
 
             try:
-                final_audio = generate_audio(aud_chunks, runtime_cfg, aud_dir, progress_cb=_progress)
+                final_audio = _call_generate_audio(aud_chunks, runtime_cfg, aud_dir, _progress)
                 if final_audio and os.path.exists(final_audio):
                     audio_path = final_audio
                     duration = mp3_duration_seconds(audio_path)
@@ -650,16 +696,16 @@ if generate and title.strip() and script.strip():
                         img_chunks = [script]
                     else:
                         sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', script.strip()) if s.strip()]
-                        sentences_per_image = max(1, len(sentences) // num_images)
+                        sentences_per_image_calc = max(1, len(sentences) // num_images)
                         img_chunks = []
-                        for i in range(0, len(sentences), sentences_per_image):
-                            chunk_sentences = sentences[i:i + sentences_per_image]
+                        for i in range(0, len(sentences), sentences_per_image_calc):
+                            chunk_sentences = sentences[i:i + sentences_per_image_calc]
                             img_chunks.append(" ".join(chunk_sentences))
 
                     tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(img_chunks)} Immagini"
                     display_timeline(tracker, timeline_container)
 
-                    generate_images(img_chunks, runtime_cfg, img_dir, progress_cb=_progress)
+                    _call_generate_images(img_chunks, runtime_cfg, img_dir, _progress)
                     zip_images(base)
                     tracker.complete_step(step_idx, "completed")
                     with debug_container:
@@ -670,7 +716,7 @@ if generate and title.strip() and script.strip():
                     tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
                     display_timeline(tracker, timeline_container)
 
-                    generate_images(groups, runtime_cfg, img_dir, progress_cb=_progress)
+                    _call_generate_images(groups, runtime_cfg, img_dir, _progress)
                     zip_images(base)
                     tracker.complete_step(step_idx, "completed")
                     with debug_container:
@@ -861,3 +907,4 @@ st.markdown("""
     Timeline real-time + Sistema Resume integrati
 </div>
 """, unsafe_allow_html=True)
+

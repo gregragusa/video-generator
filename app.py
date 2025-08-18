@@ -558,10 +558,16 @@ if generate and title.strip() and script.strip():
     
     st.session_state["is_generating"] = True
     
+    # Debug container per vedere cosa succede
+    debug_container = st.container()
+    
     # Inizializza tracker
     tracker = ProgressTracker()
     
     try:
+        with debug_container:
+            st.write("🔍 **DEBUG**: Inizializzazione...")
+        
         # Setup directories
         safe = sanitize(title)
         base = os.path.join("data", "outputs", safe)
@@ -570,11 +576,17 @@ if generate and title.strip() and script.strip():
         os.makedirs(img_dir, exist_ok=True)
         os.makedirs(aud_dir, exist_ok=True)
         audio_path = os.path.join(aud_dir, "combined_audio.mp3")
+        
+        with debug_container:
+            st.write(f"📁 Directory create: {base}")
 
         # Config runtime
         runtime_cfg = dict(base_cfg)
         replicate_from_ui = _clean_token(get_replicate_key())
         fishaudio_from_ui = _clean_token(get_fishaudio_key())
+
+        with debug_container:
+            st.write(f"🔐 API Keys - Replicate: {'✅' if replicate_from_ui else '❌'} | FishAudio: {'✅' if fishaudio_from_ui else '❌'}")
 
         if replicate_from_ui:
             os.environ["REPLICATE_API_TOKEN"] = replicate_from_ui
@@ -595,9 +607,19 @@ if generate and title.strip() and script.strip():
         runtime_cfg["chunk_size"] = get_chunk_size()
         runtime_cfg["sleep_time"] = get_sleep_time()
 
+        with debug_container:
+            st.write(f"⚙️ Config - Chunk: {get_chunk_size()} | Sleep: {get_sleep_time()}s | Model: {replicate_model or 'N/A'} | Voice: {fish_voice or 'N/A'}")
+
         # Calcola stime per tracker
         chunk_size = get_chunk_size()
+        
+        with debug_container:
+            st.write(f"📝 Chunking script di {len(script)} caratteri...")
+        
         aud_chunks = chunk_text_for_audio(script, target_chars=chunk_size) if mode in ["Audio", "Entrambi"] else []
+        
+        with debug_container:
+            st.write(f"🎧 Audio chunks creati: {len(aud_chunks)}")
         
         if mode == "Entrambi":
             estimated_audio_duration = (len(script) / 5) / 150 * 60
@@ -607,9 +629,32 @@ if generate and title.strip() and script.strip():
         else:
             estimated_images = 0
 
+        with debug_container:
+            st.write(f"🖼️ Immagini stimate: {estimated_images}")
+
+        # Verifica prerequisiti prima di iniziare
+        if mode in ["Audio", "Entrambi"]:
+            if not fishaudio_from_ui:
+                st.error("❌ FishAudio API key mancante!")
+                st.stop()
+            if not fish_voice:
+                st.error("❌ FishAudio Voice ID mancante!")
+                st.stop()
+        
+        if mode in ["Immagini", "Entrambi"]:
+            if not replicate_from_ui:
+                st.error("❌ Replicate API key mancante!")
+                st.stop()
+            if not replicate_model:
+                st.error("❌ Modello Replicate mancante!")
+                st.stop()
+
         # Inizializza tracker con stime
         tracker.start(len(aud_chunks), estimated_images)
         
+        with debug_container:
+            st.write("🎯 **Prerequisiti verificati, iniziando generazione...**")
+
         # Display timeline iniziale
         display_timeline(tracker, timeline_container)
 
@@ -617,43 +662,52 @@ if generate and title.strip() and script.strip():
 
         # ---- AUDIO ----
         if mode in ["Audio", "Entrambi"]:
+            with debug_container:
+                st.write("🎧 **Iniziando generazione AUDIO...**")
+            
             step_idx = tracker.add_step("audio", f"🎧 Generazione Audio ({len(aud_chunks)} segmenti)")
             display_timeline(tracker, timeline_container)
             
-            if not fish_ok:
-                tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, "❌ FishAudio API key mancante", "failed")
-                display_timeline(tracker, timeline_container)
-                st.error("❌ FishAudio API key mancante. Inseriscila nella sidebar.")
-                st.stop()
-            elif not get_fishaudio_voice_id():
-                tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, "❌ FishAudio Voice ID mancante", "failed")
-                display_timeline(tracker, timeline_container)
-                st.error("❌ FishAudio Voice ID mancante. Inseriscilo nella sidebar.")
-                st.stop()
-            else:
-                tracker.add_substep(step_idx, f"📝 Creati {len(aud_chunks)} chunk da ~{chunk_size} caratteri", "completed")
-                display_timeline(tracker, timeline_container)
-                
+            tracker.add_substep(step_idx, f"📝 Creati {len(aud_chunks)} chunk da ~{chunk_size} caratteri", "completed")
+            display_timeline(tracker, timeline_container)
+            
+            with debug_container:
+                st.write("🔄 Chiamando generate_audio()...")
+            
+            try:
                 final_audio = generate_audio(aud_chunks, runtime_cfg, aud_dir)
+                
                 if final_audio:
                     audio_path = final_audio
                     duration = mp3_duration_seconds(audio_path)
                     tracker.complete_step(step_idx, "completed")
                     tracker.steps[step_idx]["description"] = f"🎵 Audio Completato ({duration:.1f}s = {duration/60:.1f}min)"
                     tracker.add_substep(step_idx, f"🔊 Audio finale: {duration:.1f}s", "completed")
+                    
+                    with debug_container:
+                        st.write(f"✅ Audio completato: {final_audio}")
                 else:
                     tracker.complete_step(step_idx, "failed")
                     tracker.add_substep(step_idx, "❌ Generazione audio fallita", "failed")
                     display_timeline(tracker, timeline_container)
                     st.error("⚠️ Audio non generato: controlla API key/voice/model nella sidebar.")
                     st.stop()
-                
-                display_timeline(tracker, timeline_container)
+                    
+            except Exception as audio_error:
+                with debug_container:
+                    st.error(f"❌ ERRORE AUDIO: {audio_error}")
+                    st.code(str(audio_error))
+                tracker.complete_step(step_idx, "failed")
+                tracker.add_substep(step_idx, f"❌ Errore: {str(audio_error)[:50]}", "failed")
+                raise audio_error
+            
+            display_timeline(tracker, timeline_container)
 
         # ---- IMMAGINI ----
         if mode in ["Immagini", "Entrambi"]:
+            with debug_container:
+                st.write("🖼️ **Iniziando generazione IMMAGINI...**")
+            
             if mode == "Entrambi":
                 step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini (basata su durata audio)")
             else:
@@ -661,61 +715,81 @@ if generate and title.strip() and script.strip():
             
             display_timeline(tracker, timeline_container)
             
-            if not rep_ok:
-                tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, "❌ Replicate API key mancante", "failed")
-                display_timeline(tracker, timeline_container)
-                st.error("❌ Replicate API key mancante. Inseriscila nella sidebar.")
-                st.stop()
-            elif not get_replicate_model():
-                tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, "❌ Modello Replicate mancante", "failed")
-                display_timeline(tracker, timeline_container)
-                st.error("❌ Modello Replicate mancante. Seleziona un preset o inserisci un Custom model.")
-                st.stop()
-            else:
-                if mode == "Entrambi":
-                    if not os.path.exists(audio_path):
-                        tracker.complete_step(step_idx, "failed")
-                        tracker.add_substep(step_idx, "❌ Audio non trovato", "failed")
-                        display_timeline(tracker, timeline_container)
-                        st.error("❌ Audio non trovato per calcolare le immagini.")
-                        st.stop()
+            if mode == "Entrambi":
+                if not os.path.exists(audio_path):
+                    tracker.complete_step(step_idx, "failed")
+                    tracker.add_substep(step_idx, "❌ Audio non trovato", "failed")
+                    display_timeline(tracker, timeline_container)
+                    st.error("❌ Audio non trovato per calcolare le immagini.")
+                    st.stop()
+                else:
+                    duration_sec = mp3_duration_seconds(audio_path) or 60
+                    num_images = max(1, int(duration_sec // seconds_per_img))
+                    
+                    tracker.add_substep(step_idx, f"📊 Audio {duration_sec:.1f}s → {num_images} immagini", "completed")
+                    
+                    if num_images == 1:
+                        img_chunks = [script]
                     else:
-                        duration_sec = mp3_duration_seconds(audio_path) or 60
-                        num_images = max(1, int(duration_sec // seconds_per_img))
-                        
-                        tracker.add_substep(step_idx, f"📊 Audio {duration_sec:.1f}s → {num_images} immagini", "completed")
-                        
-                        if num_images == 1:
-                            img_chunks = [script]
-                        else:
-                            sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', script.strip()) if s.strip()]
-                            sentences_per_image = max(1, len(sentences) // num_images)
-                            img_chunks = []
-                            for i in range(0, len(sentences), sentences_per_image):
-                                chunk_sentences = sentences[i:i + sentences_per_image]
-                                img_chunks.append(" ".join(chunk_sentences))
-                        
-                        tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(img_chunks)} Immagini"
-                        display_timeline(tracker, timeline_container)
-                        
+                        sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', script.strip()) if s.strip()]
+                        sentences_per_image = max(1, len(sentences) // num_images)
+                        img_chunks = []
+                        for i in range(0, len(sentences), sentences_per_image):
+                            chunk_sentences = sentences[i:i + sentences_per_image]
+                            img_chunks.append(" ".join(chunk_sentences))
+                    
+                    tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(img_chunks)} Immagini"
+                    display_timeline(tracker, timeline_container)
+                    
+                    with debug_container:
+                        st.write(f"🔄 Chiamando generate_images() per {len(img_chunks)} immagini...")
+                    
+                    try:
                         generate_images(img_chunks, runtime_cfg, img_dir)
                         zip_images(base)
                         tracker.complete_step(step_idx, "completed")
-                else:
-                    groups = chunk_by_sentences_count(script, int(sentences_per_image))
-                    tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi di {int(sentences_per_image)} frasi", "completed")
-                    tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
-                    display_timeline(tracker, timeline_container)
-                    
+                        
+                        with debug_container:
+                            st.write("✅ Immagini completate")
+                            
+                    except Exception as images_error:
+                        with debug_container:
+                            st.error(f"❌ ERRORE IMMAGINI: {images_error}")
+                            st.code(str(images_error))
+                        tracker.complete_step(step_idx, "failed")
+                        tracker.add_substep(step_idx, f"❌ Errore: {str(images_error)[:50]}", "failed")
+                        raise images_error
+            else:
+                groups = chunk_by_sentences_count(script, int(sentences_per_image))
+                tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi di {int(sentences_per_image)} frasi", "completed")
+                tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
+                display_timeline(tracker, timeline_container)
+                
+                with debug_container:
+                    st.write(f"🔄 Chiamando generate_images() per {len(groups)} immagini...")
+                
+                try:
                     generate_images(groups, runtime_cfg, img_dir)
                     zip_images(base)
                     tracker.complete_step(step_idx, "completed")
-                
-                display_timeline(tracker, timeline_container)
+                    
+                    with debug_container:
+                        st.write("✅ Immagini completate")
+                        
+                except Exception as images_error:
+                    with debug_container:
+                        st.error(f"❌ ERRORE IMMAGINI: {images_error}")
+                        st.code(str(images_error))
+                    tracker.complete_step(step_idx, "failed")
+                    tracker.add_substep(step_idx, f"❌ Errore: {str(images_error)[:50]}", "failed")
+                    raise images_error
+            
+            display_timeline(tracker, timeline_container)
 
         # Finalizzazione
+        with debug_container:
+            st.write("🎉 **Finalizzando...**")
+        
         final_step = tracker.add_step("finalize", "🎉 Finalizzazione e Packaging")
         display_timeline(tracker, timeline_container)
         
@@ -745,6 +819,9 @@ if generate and title.strip() and script.strip():
         st.balloons()
         st.success(f"✅ **Generazione completata in {total_time/60:.1f} minuti!**")
         
+        with debug_container:
+            st.write("🎉 **TUTTO COMPLETATO CON SUCCESSO!**")
+
         # Summary dettagliato
         with st.expander("📊 Statistiche Dettagliate", expanded=True):
             col1, col2, col3 = st.columns(3)
@@ -769,18 +846,25 @@ if generate and title.strip() and script.strip():
                     st.metric("🎨 Immagini", estimated_images)
 
     except Exception as e:
+        with debug_container:
+            st.error(f"💥 **ERRORE PRINCIPALE**: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+        
         if 'tracker' in locals() and tracker.current_step is not None:
             tracker.complete_step(tracker.current_step, "failed")
             tracker.add_substep(tracker.current_step, f"❌ Errore: {str(e)[:100]}", "failed")
             display_timeline(tracker, timeline_container)
         
         st.error(f"❌ Errore durante generazione: {e}")
-        with st.expander("🔍 Dettagli Errore", expanded=False):
+        with st.expander("🔍 Dettagli Errore Completi", expanded=True):
             import traceback
             st.code(traceback.format_exc())
     
     finally:
         st.session_state["is_generating"] = False
+        with debug_container:
+            st.write("🔚 **Generazione terminata, flag rimosso**")
 
 # ===========================
 # 📥 DOWNLOAD SECTION (Sempre visibile)

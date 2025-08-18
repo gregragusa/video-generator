@@ -1,15 +1,16 @@
 # app.py
 # -------------------------------------------------------
 # Streamlit app: genera IMMAGINI / AUDIO con Replicate + FishAudio.
-# Compatibile con Python 3.13: niente pydub; ffmpeg via imageio-ffmpeg lato utils.
-# VERSIONE con TIMELINE, CHECKPOINT e RESUME ROBUSTI + ANTI-STALLO
-# (Compatibile con utils.py vecchio o nuovo tramite wrapper)
+# Compatibile con Python 3.13: niente pydub; usa ffmpeg (via sistema) e mutagen nel utils.
+# VERSIONE con TIMELINE, CHECKPOINT & RESUME ROBUSTO + ANTI-STALLO + RESUME "pendenti"
+# (Compatibile con utils.py vecchio o nuovo tramite wrapper progress_cb)
 # -------------------------------------------------------
 
 import os
 import re
 import json
 import time
+import subprocess
 import requests
 from datetime import datetime
 import streamlit as st
@@ -27,7 +28,7 @@ from scripts.utils import (
     chunk_text_for_audio,   # chunking specifico per audio
     generate_audio,
     generate_images,
-    mp3_duration_seconds,   # util per leggere durata MP3
+    mp3_duration_seconds,   # utile per durata MP3
 )
 
 # Proviamo a importare load_checkpoint/save_checkpoint se esistono (nuova versione)
@@ -172,7 +173,7 @@ def display_timeline(tracker: ProgressTracker, container):
         st.progress(progress, text=f"Progresso generale: {progress*100:.1f}%")
 
         st.markdown("### 📋 Timeline Dettagliata")
-        for i, step in enumerate(tracker.steps):
+        for step in tracker.steps:
             if step["status"] == "completed":
                 icon = "✅"; style = ""
             elif step["status"] == "failed":
@@ -219,7 +220,7 @@ def zip_images(base_dir: str):
     with zipfile.ZipFile(zip_path, "w") as zipf:
         for filename in os.listdir(img_dir):
             full_path = os.path.join(img_dir, filename)
-            if os.path.isfile(full_path):
+            if os.path.isfile(full_path) and not filename.startswith("_tmp"):
                 zipf.write(full_path, arcname=os.path.join("images", filename))
     return zip_path
 
@@ -306,6 +307,91 @@ def clear_lock(base_dir: str):
         os.remove(_lock_path(base_dir))
     except Exception:
         pass
+
+# ----- RESUME HELPERS (audio & immagini) -----
+def count_leading_parts(dir_path: str, prefix: str, ext_set=("mp3", "wav", "m4a", "png", "jpg", "jpeg")) -> int:
+    """Conta quanti file consecutivi esistono a partire da indice 0: prefix_000.ext, prefix_001.ext, ..."""
+    i = 0
+    while True:
+        found = False
+        for ext in ext_set:
+            if os.path.exists(os.path.join(dir_path, f"{prefix}_{i:03d}.{ext}")):
+                found = True
+                break
+        if not found:
+            return i
+        i += 1
+
+def ensure_empty_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+    for n in os.listdir(path):
+        try:
+            os.remove(os.path.join(path, n))
+        except Exception:
+            pass
+
+def list_files_by_mtime(path: str, ext_set):
+    files = []
+    for n in os.listdir(path):
+        if n.startswith("."):
+            continue
+        ext = n.split(".")[-1].lower()
+        if ext in ext_set:
+            files.append(n)
+    files.sort(key=lambda n: os.path.getmtime(os.path.join(path, n)))
+    return files
+
+def move_files_renumber(src_dir: str, dst_dir: str, dst_start_index: int, prefix: str, out_ext: str, accept_exts):
+    """
+    Prende tutti i file in src_dir (filtrati per accept_exts), li ordina per mtime
+    e li rinomina in dst_dir come prefix_{dst_start_index + i:03d}.{out_ext}.
+    """
+    moved = 0
+    files = list_files_by_mtime(src_dir, accept_exts)
+    for j, name in enumerate(files):
+        src = os.path.join(src_dir, name)
+        dst = os.path.join(dst_dir, f"{prefix}_{(dst_start_index + j):03d}.{out_ext}")
+        try:
+            os.replace(src, dst)
+        except Exception:
+            import shutil
+            shutil.copy2(src, dst)
+            try:
+                os.remove(src)
+            except Exception:
+                pass
+        moved += 1
+    return moved
+
+def combine_audio_parts(aud_dir: str, total_parts: int, combined_name="combined_audio.mp3") -> str | None:
+    """
+    Combina part_000..part_{N-1}.mp3 in un unico MP3 usando ffmpeg.
+    Se ffmpeg manca o fallisce, ritorna None (i part_*.mp3 restano validi).
+    """
+    # Verifica presenza di tutti i pezzi
+    for i in range(total_parts):
+        if not os.path.exists(os.path.join(aud_dir, f"part_{i:03d}.mp3")):
+            return None
+
+    filelist_path = os.path.join(aud_dir, "_concat_list.txt")
+    with open(filelist_path, "w", encoding="utf-8") as f:
+        for i in range(total_parts):
+            p = os.path.join(aud_dir, f"part_{i:03d}.mp3")
+            f.write(f"file '{p}'\n")
+
+    out_path = os.path.join(aud_dir, combined_name)
+    try:
+        # Ricodifica per evitare problemi di "stream copy" se i bitrates differiscono
+        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", filelist_path, "-c:a", "libmp3lame", "-b:a", "192k", out_path]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return out_path if os.path.exists(out_path) else None
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(filelist_path)
+        except Exception:
+            pass
 
 # ---------------------------
 # Streamlit App Setup
@@ -604,7 +690,7 @@ with col_timeline:
             st.info("⏳ Premi 'Genera contenuti' per iniziare la timeline")
 
 # ===========================
-# 🚀 Avvio generazione (con anti-stallo)
+# 🚀 Avvio generazione (con anti-stallo e resume pendenti)
 # ===========================
 if generate and title.strip() and script.strip():
     # Se un'altra sessione è rimasta appesa ma lo stop è vecchio, sblocca
@@ -673,6 +759,7 @@ if generate and title.strip() and script.strip():
     chunk_size = runtime_cfg["chunk_size"]
     aud_chunks = chunk_text_for_audio(script, target_chars=chunk_size) if mode in ["Audio", "Entrambi"] else []
 
+    # stime immagini
     if mode == "Entrambi":
         estimated_audio_duration = (len(script) / 5) / 150 * 60
         estimated_images = max(1, int(estimated_audio_duration // st.session_state.get("seconds_per_img", 8)))
@@ -695,51 +782,89 @@ if generate and title.strip() and script.strip():
     debug_container = st.container()
 
     try:
-        # ---- AUDIO ----
+        # ---- AUDIO (resume-aware) ----
         if mode in ["Audio", "Entrambi"]:
             with debug_container:
-                st.write("🎧 **Iniziando generazione AUDIO...**")
-            step_idx = tracker.add_step("audio", f"🎧 Generazione Audio ({len(aud_chunks)} segmenti)")
-            display_timeline(tracker, timeline_container)
-            tracker.add_substep(step_idx, f"📝 Creati {len(aud_chunks)} chunk da ~{chunk_size} caratteri", "completed")
+                st.write("🎧 **Iniziando generazione AUDIO (resume-aware)...**")
+            step_idx = tracker.add_step("audio", f"🎧 Generazione Audio")
             display_timeline(tracker, timeline_container)
 
-            final_audio = _call_generate_audio(aud_chunks, runtime_cfg, aud_dir, _progress)
-            if final_audio and os.path.exists(final_audio):
-                audio_path = final_audio
-                duration = mp3_duration_seconds(audio_path)
-                tracker.complete_step(step_idx, "completed")
-                tracker.steps[step_idx]["description"] = f"🎵 Audio Completato ({duration:.1f}s = {duration/60:.1f}min)"
-                tracker.add_substep(step_idx, f"🔊 Audio finale: {duration:.1f}s", "completed")
-            else:
-                tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, "❌ Generazione audio fallita", "failed")
+            tracker.add_substep(step_idx, f"📝 Creazione chunk audio...", "completed")
+            display_timeline(tracker, timeline_container)
+
+            total_chunks = len(aud_chunks)
+            leading_done = count_leading_parts(aud_dir, "part", ("mp3",))
+            tracker.add_substep(step_idx, f"📦 Rilevati {leading_done}/{total_chunks} chunk già generati", "completed")
+            display_timeline(tracker, timeline_container)
+
+            pending = aud_chunks[leading_done:] if total_chunks > leading_done else []
+            if pending:
+                tmp_audio_dir = os.path.join(aud_dir, "_tmp")
+                ensure_empty_dir(tmp_audio_dir)
+
+                tracker.add_substep(step_idx, f"🔄 Generazione {len(pending)} chunk residui (da index {leading_done})", "completed")
                 display_timeline(tracker, timeline_container)
-                st.error("⚠️ Audio non generato.")
-                st.stop()
 
+                _call_generate_audio(pending, runtime_cfg, tmp_audio_dir, _progress)
+
+                # Integra i nuovi file, qualunque nome abbiano, ordinati per mtime
+                moved = move_files_renumber(tmp_audio_dir, aud_dir, leading_done, "part", "mp3", {"mp3","wav","m4a"})
+                tracker.add_substep(step_idx, f"📥 Integrati {moved} nuovi chunk in sequenza", "completed")
+                display_timeline(tracker, timeline_container)
+
+            # Aggiorna checkpoint
+            try:
+                done_now = count_leading_parts(aud_dir, "part", ("mp3",))
+                save_checkpoint(base, {"audio_completed": done_now}, merge=True)
+            except Exception:
+                pass
+
+            # Combina se abbiamo tutti i pezzi
+            final_audio = None
+            try:
+                if total_chunks > 0:
+                    done_now = count_leading_parts(aud_dir, "part", ("mp3",))
+                    if done_now == total_chunks:
+                        final_audio = combine_audio_parts(aud_dir, total_chunks)
+                        if final_audio:
+                            audio_path = final_audio
+                            duration = mp3_duration_seconds(audio_path)
+                            tracker.add_substep(step_idx, f"🎵 Audio combinato: {duration:.1f}s", "completed")
+                        else:
+                            tracker.add_substep(step_idx, "ℹ️ Combined non creato (ffmpeg non disponibile o errore). Restano i part_*.mp3", "completed")
+                    else:
+                        tracker.add_substep(step_idx, f"ℹ️ Chunk presenti: {done_now}/{total_chunks}. Il combined verrà creato quando saranno tutti disponibili.", "completed")
+            except Exception as combo_err:
+                tracker.add_substep(step_idx, f"⚠️ Combine fallito: {combo_err}", "failed")
+
+            have_any = count_leading_parts(aud_dir, "part", ("mp3",)) > 0
+            tracker.complete_step(step_idx, "completed" if have_any else "failed")
             display_timeline(tracker, timeline_container)
 
-        # ---- IMMAGINI ----
+        # ---- IMMAGINI (resume-aware) ----
         if mode in ["Immagini", "Entrambi"]:
             with debug_container:
-                st.write("🖼️ **Iniziando generazione IMMAGINI...**")
-            if mode == "Entrambi":
-                step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini (basata su durata audio)")
-            else:
-                step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini ({estimated_images} immagini)")
-            display_timeline(tracker, timeline_container)
+                st.write("🖼️ **Iniziando generazione IMMAGINI (resume-aware)...**")
 
             if mode == "Entrambi":
+                step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini (da durata audio)")
+            else:
+                step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini")
+            display_timeline(tracker, timeline_container)
+
+            # Costruisci lista chunk testuali per immagini
+            if mode == "Entrambi":
                 if not os.path.exists(audio_path):
+                    # Se il combined non c'è, calcola comunque dalla stima (fallback) usando la durata totale stimata dei part_*
+                    # oppure prosegui con le frasi, ma preferiamo fermarci per coerenza UX:
                     tracker.complete_step(step_idx, "failed")
-                    tracker.add_substep(step_idx, "❌ Audio non trovato", "failed")
+                    tracker.add_substep(step_idx, "❌ Audio combinato non trovato. Genera o completa l'audio prima.", "failed")
                     display_timeline(tracker, timeline_container)
                     st.error("❌ Audio non trovato per calcolare le immagini.")
                     st.stop()
 
-                seconds_per_img = st.session_state.get("seconds_per_img", 8)
                 duration_sec = mp3_duration_seconds(audio_path) or 60
+                seconds_per_img = st.session_state.get("seconds_per_img", 8)
                 num_images = max(1, int(duration_sec // seconds_per_img))
                 tracker.add_substep(step_idx, f"📊 Audio {duration_sec:.1f}s → {num_images} immagini", "completed")
 
@@ -752,21 +877,46 @@ if generate and title.strip() and script.strip():
                     for i in range(0, len(sentences), sentences_per_image_calc):
                         chunk_sentences = sentences[i:i + sentences_per_image_calc]
                         img_chunks.append(" ".join(chunk_sentences))
-
-                tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(img_chunks)} Immagini"
-                display_timeline(tracker, timeline_container)
-                _call_generate_images(img_chunks, runtime_cfg, img_dir, _progress)
-                zip_images(base)
-                tracker.complete_step(step_idx, "completed")
             else:
                 groups = chunk_by_sentences_count(script, int(st.session_state.get("sentences_per_image", 2)))
-                tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi di {int(st.session_state.get('sentences_per_image', 2))} frasi", "completed")
-                tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
-                display_timeline(tracker, timeline_container)
-                _call_generate_images(groups, runtime_cfg, img_dir, _progress)
-                zip_images(base)
-                tracker.complete_step(step_idx, "completed")
+                img_chunks = groups
+                tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi", "completed")
 
+            total_imgs = len(img_chunks)
+            leading_imgs = count_leading_parts(img_dir, "img", ("png","jpg","jpeg"))
+            tracker.add_substep(step_idx, f"📦 Rilevate {leading_imgs}/{total_imgs} immagini già pronte", "completed")
+            display_timeline(tracker, timeline_container)
+
+            pending_imgs = img_chunks[leading_imgs:] if total_imgs > leading_imgs else []
+            if pending_imgs:
+                tmp_img_dir = os.path.join(img_dir, "_tmp")
+                ensure_empty_dir(tmp_img_dir)
+
+                tracker.add_substep(step_idx, f"🔄 Generazione {len(pending_imgs)} immagini residue (da index {leading_imgs})", "completed")
+                display_timeline(tracker, timeline_container)
+
+                # Genera SOLO i pendenti nella cartella temporanea
+                _call_generate_images(pending_imgs, runtime_cfg, tmp_img_dir, _progress)
+
+                # Integra i nuovi file, qualunque nome/estensione abbiano (preferisci PNG)
+                moved = move_files_renumber(tmp_img_dir, img_dir, leading_imgs, "img", "png", {"png","jpg","jpeg"})
+                if moved == 0:
+                    # fallback: prova jpg come out_ext
+                    moved = move_files_renumber(tmp_img_dir, img_dir, leading_imgs, "img", "jpg", {"png","jpg","jpeg"})
+                tracker.add_substep(step_idx, f"📥 Integrate {moved} nuove immagini in sequenza", "completed")
+                display_timeline(tracker, timeline_container)
+
+                # Crea/aggiorna ZIP
+                zip_images(base)
+
+            # Aggiorna checkpoint
+            try:
+                done_imgs = count_leading_parts(img_dir, "img", ("png","jpg","jpeg"))
+                save_checkpoint(base, {"images_completed": done_imgs}, merge=True)
+            except Exception:
+                pass
+
+            tracker.complete_step(step_idx, "completed" if count_leading_parts(img_dir, "img", ("png","jpg","jpeg")) > 0 else "failed")
             display_timeline(tracker, timeline_container)
 
         # Finalizzazione
@@ -929,7 +1079,6 @@ st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
     🎬 <strong>Generatore Video AI</strong> |
     Powered by Replicate + FishAudio |
-    Timeline real-time + Sistema Resume + Anti-stallo
+    Timeline real-time • Resume robusto (chunk/immagini pendenti) • Anti-stallo
 </div>
 """, unsafe_allow_html=True)
-

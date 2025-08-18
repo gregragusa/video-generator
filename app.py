@@ -1,17 +1,17 @@
 # app.py
 # -------------------------------------------------------
-# Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
-# Compatibile con Python 3.13: niente pydub; usiamo mutagen + ffmpeg via imageio-ffmpeg.
-# VERSIONE COMPLETA CON TIMELINE E SISTEMA RESUME
+# Streamlit app: genera IMMAGINI / AUDIO con Replicate + FishAudio.
+# Compatibile con Python 3.13: niente pydub; ffmpeg via imageio-ffmpeg lato utils.
+# VERSIONE con TIMELINE, CHECKPOINT e RESUME ROBUSTI
 # -------------------------------------------------------
 
 import os
 import re
 import time
-import requests
-import streamlit as st
-from datetime import datetime, timedelta
 import json
+import requests
+from datetime import datetime
+import streamlit as st
 
 # se hai questo loader lo usiamo, altrimenti proseguiamo senza
 try:
@@ -19,13 +19,16 @@ try:
 except Exception:
     load_config = None
 
+# Utils aggiornati (vedi canvas: contengono checkpoint atomici e resume idempotente)
 from scripts.utils import (
     chunk_text,
     chunk_by_sentences_count,
-    chunk_text_for_audio,  # chunking specifico per audio
+    chunk_text_for_audio,   # chunking specifico per audio
     generate_audio,
     generate_images,
-    mp3_duration_seconds,  # util per leggere durata MP3
+    mp3_duration_seconds,   # util per leggere durata MP3
+    load_checkpoint,        # NEW
+    save_checkpoint,        # NEW
 )
 
 # ---------------------------
@@ -34,30 +37,21 @@ from scripts.utils import (
 
 class ProgressTracker:
     """Sistema di tracking timeline per generazione"""
-    
     def __init__(self):
         self.start_time = None
         self.steps = []
         self.current_step = None
         self.estimated_total_seconds = 0
-        self.total_audio_chunks = 0
-        self.total_images = 0
-    
+
     def start(self, total_audio_chunks: int, total_images: int):
-        """Inizia tracking con stime"""
         self.start_time = datetime.now()
-        self.total_audio_chunks = total_audio_chunks
-        self.total_images = total_images
-        
         # Stime basate su esperienza reale
-        audio_estimate = total_audio_chunks * 12  # ~12s per chunk audio
-        image_estimate = total_images * 18        # ~18s per immagine
+        audio_estimate = (total_audio_chunks or 0) * 12  # ~12s per chunk audio
+        image_estimate = (total_images or 0) * 18        # ~18s per immagine
         self.estimated_total_seconds = audio_estimate + image_estimate
-        
         self.steps = []
-        
+
     def add_step(self, step_type: str, description: str, status: str = "running"):
-        """Aggiunge step alla timeline"""
         step = {
             "type": step_type,
             "description": description,
@@ -70,9 +64,8 @@ class ProgressTracker:
         self.steps.append(step)
         self.current_step = len(self.steps) - 1
         return self.current_step
-    
+
     def add_substep(self, step_index: int, description: str, status: str = "completed"):
-        """Aggiunge substep a uno step esistente"""
         if 0 <= step_index < len(self.steps):
             substep = {
                 "description": description,
@@ -80,95 +73,70 @@ class ProgressTracker:
                 "timestamp": datetime.now()
             }
             self.steps[step_index]["substeps"].append(substep)
-    
+
     def complete_step(self, step_index: int, status: str = "completed"):
-        """Completa uno step"""
         if 0 <= step_index < len(self.steps):
             self.steps[step_index]["end_time"] = datetime.now()
             self.steps[step_index]["status"] = status
             if self.steps[step_index]["start_time"]:
                 duration = self.steps[step_index]["end_time"] - self.steps[step_index]["start_time"]
                 self.steps[step_index]["duration"] = duration.total_seconds()
-    
+
     def get_elapsed_time(self):
-        """Tempo totale trascorso"""
         if self.start_time:
             return (datetime.now() - self.start_time).total_seconds()
         return 0
-    
+
     def get_eta(self):
-        """Stima tempo rimanente basata su performance reale"""
         elapsed = self.get_elapsed_time()
-        if elapsed < 30:  # Primi 30 secondi usa stima iniziale
+        if elapsed < 30:
             return max(0, self.estimated_total_seconds - elapsed)
-        
-        # Dopo 30s, usa performance reale
         completed_steps = len([s for s in self.steps if s["status"] == "completed"])
         total_steps = len(self.steps)
-        
         if completed_steps > 0 and total_steps > 0:
             avg_time_per_step = elapsed / completed_steps
             remaining_steps = total_steps - completed_steps
             return max(0, remaining_steps * avg_time_per_step)
-        
         return max(0, self.estimated_total_seconds - elapsed)
-    
+
     def get_completion_percentage(self):
-        """Percentuale completamento"""
         if not self.steps:
             return 0
         completed = len([s for s in self.steps if s["status"] == "completed"])
         return min(100, (completed / len(self.steps)) * 100)
 
 def display_timeline(tracker: ProgressTracker, container):
-    """Mostra timeline real-time in un container Streamlit"""
-    
     if not tracker.start_time:
         return
-    
     with container:
-        # Header con metriche
         col1, col2, col3, col4 = st.columns(4)
-        
         with col1:
             elapsed = tracker.get_elapsed_time()
             st.metric("⏱️ Trascorso", f"{elapsed/60:.1f} min")
-        
         with col2:
             eta = tracker.get_eta()
             st.metric("🎯 ETA", f"{eta/60:.1f} min")
-        
         with col3:
             total_estimate = (elapsed + eta) / 60
             st.metric("📊 Totale Stimato", f"{total_estimate:.1f} min")
-        
         with col4:
             completed = len([s for s in tracker.steps if s["status"] == "completed"])
             st.metric("✅ Completati", f"{completed}/{len(tracker.steps)}")
-        
-        # Progress bar generale
+
         progress = tracker.get_completion_percentage() / 100
         st.progress(progress, text=f"Progresso generale: {progress*100:.1f}%")
-        
-        # Timeline dettagliata
+
         st.markdown("### 📋 Timeline Dettagliata")
-        
         for i, step in enumerate(tracker.steps):
-            # Determina icona e stile
             if step["status"] == "completed":
-                icon = "✅"
-                style = ""
+                icon = "✅"; style = ""
             elif step["status"] == "failed":
-                icon = "❌"
-                style = ""
+                icon = "❌"; style = ""
             elif step["status"] == "running":
-                icon = "🔄"
-                style = "**"
+                icon = "🔄"; style = "**"
             else:
-                icon = "⏳"
-                style = ""
-            
-            # Calcola tempo
+                icon = "⏳"; style = ""
+
             if step["duration"]:
                 time_str = f"({step['duration']:.1f}s)"
             elif step["status"] == "running":
@@ -176,15 +144,12 @@ def display_timeline(tracker: ProgressTracker, container):
                 time_str = f"({running_time:.1f}s...)"
             else:
                 time_str = ""
-            
-            # Mostra step principale
+
             step_text = f"{icon} {style}{step['description']}{style} {time_str}"
             st.markdown(step_text)
-            
-            # Mostra substeps (ultimi 3 per step attivo)
+
             if step["substeps"]:
                 substeps_to_show = step["substeps"][-3:] if step["status"] == "running" else step["substeps"][-1:]
-                
                 for substep in substeps_to_show:
                     substep_icon = "✅" if substep["status"] == "completed" else "❌"
                     st.markdown(f"   └ {substep_icon} {substep['description']}")
@@ -221,23 +186,18 @@ def _mask(tok: str) -> str:
     return t[:3] + "…" + t[-4:] if len(t) > 8 else "—"
 
 def validate_replicate_model(model_name: str, api_key: str) -> bool:
-    """Verifica se un modello Replicate esiste ed è accessibile"""
     if not model_name or not api_key:
         return False
-    
     try:
         if ":" not in model_name:
             model_name += ":latest"
-            
         owner, name_version = model_name.split("/", 1)
         name = name_version.split(":")[0]
-        
         resp = requests.get(
             f"https://api.replicate.com/v1/models/{owner}/{name}",
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=10
         )
-        
         if resp.status_code == 200:
             model_info = resp.json()
             st.success(f"✅ Modello '{model_name}' trovato e accessibile")
@@ -253,7 +213,6 @@ def validate_replicate_model(model_name: str, api_key: str) -> bool:
         else:
             st.warning(f"⚠️ Modello '{model_name}' - Status: {resp.status_code}")
             return False
-            
     except Exception as e:
         st.error(f"❌ Errore validazione modello: {e}")
         return False
@@ -343,11 +302,11 @@ with st.sidebar:
 
     # Modello Replicate con modelli verificati
     model_presets = [
-        "black-forest-labs/flux-schnell",           # ✅ Veloce e affidabile
-        "black-forest-labs/flux-dev",               # ✅ Più qualità
-        "stability-ai/stable-diffusion-xl-base-1.0", # ✅ SDXL funzionante
-        "bytedance/sdxl-lightning-4step",           # ✅ Veloce
-        "playgroundai/playground-v2.5-1024px-aesthetic", # ✅ Estetico
+        "black-forest-labs/flux-schnell",
+        "black-forest-labs/flux-dev",
+        "stability-ai/stable-diffusion-xl-base-1.0",
+        "bytedance/sdxl-lightning-4step",
+        "playgroundai/playground-v2.5-1024px-aesthetic",
         "Custom (digita sotto)",
     ]
     preset_selected = st.selectbox(
@@ -388,69 +347,59 @@ with st.sidebar:
     # Ottimizzazioni velocità
     st.divider()
     st.subheader("⚡ Ottimizzazioni Velocità")
-    
     speed_mode = st.selectbox("Modalità velocità", [
         "🐌 Lenta ma sicura (default)",
-        "⚡ Veloce (raccomandato)", 
+        "⚡ Veloce (raccomandato)",
         "🚀 Turbo (sperimentale)"
     ])
-    
     if speed_mode == "⚡ Veloce (raccomandato)":
         st.session_state["chunk_size"] = 3500
         st.session_state["sleep_time"] = 5
     elif speed_mode == "🚀 Turbo (sperimentale)":
         st.session_state["chunk_size"] = 5000
         st.session_state["sleep_time"] = 2
-    else:  # Lenta ma sicura
+    else:
         st.session_state["chunk_size"] = 2000
         st.session_state["sleep_time"] = 11
 
     # Gestione Resume/Checkpoint
     st.divider()
     st.subheader("🔄 Gestione Resume")
-    
     if st.button("🗑️ Pulisci tutti i checkpoint", help="Rimuove tutti i lavori salvati", key="clear_checkpoints_btn"):
-        import shutil
+        import glob
+        removed = 0
         data_dir = "data/outputs"
         if os.path.exists(data_dir):
-            try:
-                # Rimuovi tutti i file checkpoint.json
-                import glob
-                checkpoints = glob.glob(os.path.join(data_dir, "*/checkpoint.json"))
-                removed = 0
-                for cp in checkpoints:
-                    try:
-                        os.remove(cp)
-                        removed += 1
-                    except Exception:
-                        pass
-                
-                if removed > 0:
-                    st.success(f"🗑️ Rimossi {removed} checkpoint")
-                else:
-                    st.info("ℹ️ Nessun checkpoint trovato")
-            except Exception as e:
-                st.error(f"❌ Errore: {e}")
-        else:
-            st.info("ℹ️ Nessuna directory output trovata")
-    
+            checkpoints = glob.glob(os.path.join(data_dir, "*/checkpoint.json"))
+            for cp in checkpoints:
+                try:
+                    os.remove(cp)
+                    removed += 1
+                except Exception:
+                    pass
+        st.success(f"🗑️ Rimossi {removed} checkpoint" if removed else "ℹ️ Nessun checkpoint trovato")
+
     # Mostra checkpoint esistenti
     data_dir = "data/outputs"
     if os.path.exists(data_dir):
         import glob
         checkpoints = glob.glob(os.path.join(data_dir, "*/checkpoint.json"))
-        if checkpoints:
-            st.write(f"📁 Checkpoint attivi: {len(checkpoints)}")
+        if checklists := checkpoints:
+            st.write(f"📁 Checkpoint attivi: {len(checklists)}")
             with st.expander("Dettagli checkpoint"):
-                for cp in checkpoints[:5]:  # Mostra max 5
+                shown = 0
+                for cp in checklists:
+                    if shown >= 5:
+                        st.caption("…")
+                        break
                     try:
-                        import json
-                        with open(cp, 'r') as f:
+                        with open(cp, 'r', encoding="utf-8") as f:
                             data = json.load(f)
                         project_name = os.path.basename(os.path.dirname(cp))
                         audio_progress = data.get('audio_completed', 0)
                         images_progress = data.get('images_completed', 0)
                         st.write(f"• **{project_name}**: Audio {audio_progress}, Immagini {images_progress}")
+                        shown += 1
                     except Exception:
                         pass
 
@@ -478,7 +427,6 @@ rep_ok = bool(get_replicate_key())
 fish_ok = bool(get_fishaudio_key())
 rep_model = get_replicate_model() or "—"
 voice_id = get_fishaudio_voice_id() or "—"
-
 st.write(
     f"🔎 **Stato API** → Replicate: {'✅' if rep_ok else '⚠️'} · FishAudio: {'✅' if fish_ok else '⚠️'} · "
     f"Model: `{rep_model}` · Voice: `{voice_id}`"
@@ -487,18 +435,15 @@ st.write(
 # ===========================
 # 🎛️ Main Interface
 # ===========================
-
-# Layout a colonne per una migliore organizzazione
 col_main, col_timeline = st.columns([2, 3])
 
 with col_main:
     st.subheader("📝 Input")
-    
+
     title = st.text_input("Titolo del video")
     script = st.text_area("Inserisci il testo da usare per generare immagini/audio", height=200)
     mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
 
-    # Input condizionali
     if mode in ["Audio", "Entrambi"]:
         seconds_per_img = st.number_input(
             "Ogni quanti secondi di audio creare un'immagine?",
@@ -514,24 +459,21 @@ with col_main:
     if script:
         char_count = len(script)
         word_count = len(script.split())
-        
-        # Controllo resume esistente
         if title.strip():
-            from scripts.utils import load_checkpoint
             safe = sanitize(title)
             base = os.path.join("data", "outputs", safe)
             checkpoint = load_checkpoint(base)
-            
-            if checkpoint:
+            # Mostra stato parziale se presente
+            if checkpoint and (checkpoint.get("audio_completed") or checkpoint.get("images_completed")):
                 st.warning(f"""
                 🔄 **LAVORO IN CORSO RILEVATO**
                 - Audio: {checkpoint.get('audio_completed', 0)} chunk completati
                 - Immagini: {checkpoint.get('images_completed', 0)} completate  
                 - Premi 'Genera' per **continuare da dove interrotto**
                 """)
-        
+
         st.info(f"📊 Script: {char_count:,} caratteri | {word_count:,} parole")
-        
+
         if char_count > 100000:
             st.warning(f"⚠️ Script molto lungo! Generazione stimata: {char_count/10000:.1f}-{char_count/5000:.1f} minuti")
             st.info("💡 **Tip**: Il sistema salva automaticamente i progressi. Se si interrompe, riavvia per continuare.")
@@ -541,8 +483,6 @@ with col_main:
 with col_timeline:
     st.subheader("📊 Timeline Generazione")
     timeline_container = st.container()
-    
-    # Placeholder iniziale
     if not st.session_state.get("is_generating", False):
         with timeline_container:
             st.info("⏳ Premi 'Genera contenuti' per iniziare la timeline")
@@ -551,23 +491,18 @@ with col_timeline:
 # 🚀 Avvio generazione
 # ===========================
 if generate and title.strip() and script.strip():
-    # Prevenire doppi click
     if st.session_state.get("is_generating", False):
         st.warning("⏳ Generazione già in corso...")
         st.stop()
-    
+
     st.session_state["is_generating"] = True
-    
-    # Debug container per vedere cosa succede
     debug_container = st.container()
-    
-    # Inizializza tracker
     tracker = ProgressTracker()
-    
+
     try:
         with debug_container:
             st.write("🔍 **DEBUG**: Inizializzazione...")
-        
+
         # Setup directories
         safe = sanitize(title)
         base = os.path.join("data", "outputs", safe)
@@ -576,7 +511,7 @@ if generate and title.strip() and script.strip():
         os.makedirs(img_dir, exist_ok=True)
         os.makedirs(aud_dir, exist_ok=True)
         audio_path = os.path.join(aud_dir, "combined_audio.mp3")
-        
+
         with debug_container:
             st.write(f"📁 Directory create: {base}")
 
@@ -584,9 +519,6 @@ if generate and title.strip() and script.strip():
         runtime_cfg = dict(base_cfg)
         replicate_from_ui = _clean_token(get_replicate_key())
         fishaudio_from_ui = _clean_token(get_fishaudio_key())
-
-        with debug_container:
-            st.write(f"🔐 API Keys - Replicate: {'✅' if replicate_from_ui else '❌'} | FishAudio: {'✅' if fishaudio_from_ui else '❌'}")
 
         if replicate_from_ui:
             os.environ["REPLICATE_API_TOKEN"] = replicate_from_ui
@@ -603,7 +535,6 @@ if generate and title.strip() and script.strip():
         if fish_voice:
             runtime_cfg["fishaudio_voice_id"] = fish_voice
 
-        # Parametri velocità
         runtime_cfg["chunk_size"] = get_chunk_size()
         runtime_cfg["sleep_time"] = get_sleep_time()
 
@@ -612,16 +543,16 @@ if generate and title.strip() and script.strip():
 
         # Calcola stime per tracker
         chunk_size = get_chunk_size()
-        
         with debug_container:
             st.write(f"📝 Chunking script di {len(script)} caratteri...")
-        
+
         aud_chunks = chunk_text_for_audio(script, target_chars=chunk_size) if mode in ["Audio", "Entrambi"] else []
-        
         with debug_container:
             st.write(f"🎧 Audio chunks creati: {len(aud_chunks)}")
-        
+
         if mode == "Entrambi":
+            # stima grossolana per il numero di immagini; poi lo ricalcoliamo sulla durata reale
+            estimated_audio_chars_per_sec = 5 * (150/150)  # approssimazione
             estimated_audio_duration = (len(script) / 5) / 150 * 60
             estimated_images = max(1, int(estimated_audio_duration // seconds_per_img))
         elif mode == "Immagini":
@@ -632,7 +563,7 @@ if generate and title.strip() and script.strip():
         with debug_container:
             st.write(f"🖼️ Immagini stimate: {estimated_images}")
 
-        # Verifica prerequisiti prima di iniziare
+        # Verifica prerequisiti
         if mode in ["Audio", "Entrambi"]:
             if not fishaudio_from_ui:
                 st.error("❌ FishAudio API key mancante!")
@@ -640,7 +571,6 @@ if generate and title.strip() and script.strip():
             if not fish_voice:
                 st.error("❌ FishAudio Voice ID mancante!")
                 st.stop()
-        
         if mode in ["Immagini", "Entrambi"]:
             if not replicate_from_ui:
                 st.error("❌ Replicate API key mancante!")
@@ -649,41 +579,34 @@ if generate and title.strip() and script.strip():
                 st.error("❌ Modello Replicate mancante!")
                 st.stop()
 
-        # Inizializza tracker con stime
+        # Inizializza tracker
         tracker.start(len(aud_chunks), estimated_images)
-        
-        with debug_container:
-            st.write("🎯 **Prerequisiti verificati, iniziando generazione...**")
-
-        # Display timeline iniziale
         display_timeline(tracker, timeline_container)
-
         st.success(f"🎯 **Generazione Iniziata!** Stimati {len(aud_chunks)} chunk audio + {estimated_images} immagini")
+
+        # Progress callback per aggiornare timeline
+        def _progress(msg: str):
+            if tracker.current_step is not None:
+                tracker.add_substep(tracker.current_step, msg, "completed")
+                display_timeline(tracker, timeline_container)
 
         # ---- AUDIO ----
         if mode in ["Audio", "Entrambi"]:
             with debug_container:
                 st.write("🎧 **Iniziando generazione AUDIO...**")
-            
             step_idx = tracker.add_step("audio", f"🎧 Generazione Audio ({len(aud_chunks)} segmenti)")
             display_timeline(tracker, timeline_container)
-            
             tracker.add_substep(step_idx, f"📝 Creati {len(aud_chunks)} chunk da ~{chunk_size} caratteri", "completed")
             display_timeline(tracker, timeline_container)
-            
-            with debug_container:
-                st.write("🔄 Chiamando generate_audio()...")
-            
+
             try:
-                final_audio = generate_audio(aud_chunks, runtime_cfg, aud_dir)
-                
-                if final_audio:
+                final_audio = generate_audio(aud_chunks, runtime_cfg, aud_dir, progress_cb=_progress)
+                if final_audio and os.path.exists(final_audio):
                     audio_path = final_audio
                     duration = mp3_duration_seconds(audio_path)
                     tracker.complete_step(step_idx, "completed")
                     tracker.steps[step_idx]["description"] = f"🎵 Audio Completato ({duration:.1f}s = {duration/60:.1f}min)"
                     tracker.add_substep(step_idx, f"🔊 Audio finale: {duration:.1f}s", "completed")
-                    
                     with debug_container:
                         st.write(f"✅ Audio completato: {final_audio}")
                 else:
@@ -692,42 +615,37 @@ if generate and title.strip() and script.strip():
                     display_timeline(tracker, timeline_container)
                     st.error("⚠️ Audio non generato: controlla API key/voice/model nella sidebar.")
                     st.stop()
-                    
             except Exception as audio_error:
                 with debug_container:
                     st.error(f"❌ ERRORE AUDIO: {audio_error}")
-                    st.code(str(audio_error))
                 tracker.complete_step(step_idx, "failed")
-                tracker.add_substep(step_idx, f"❌ Errore: {str(audio_error)[:50]}", "failed")
-                raise audio_error
-            
+                tracker.add_substep(step_idx, f"❌ Errore: {str(audio_error)[:80]}", "failed")
+                raise
+
             display_timeline(tracker, timeline_container)
 
         # ---- IMMAGINI ----
         if mode in ["Immagini", "Entrambi"]:
             with debug_container:
                 st.write("🖼️ **Iniziando generazione IMMAGINI...**")
-            
             if mode == "Entrambi":
                 step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini (basata su durata audio)")
             else:
                 step_idx = tracker.add_step("images", f"🖼️ Generazione Immagini ({estimated_images} immagini)")
-            
             display_timeline(tracker, timeline_container)
-            
-            if mode == "Entrambi":
-                if not os.path.exists(audio_path):
-                    tracker.complete_step(step_idx, "failed")
-                    tracker.add_substep(step_idx, "❌ Audio non trovato", "failed")
-                    display_timeline(tracker, timeline_container)
-                    st.error("❌ Audio non trovato per calcolare le immagini.")
-                    st.stop()
-                else:
+
+            try:
+                if mode == "Entrambi":
+                    if not os.path.exists(audio_path):
+                        tracker.complete_step(step_idx, "failed")
+                        tracker.add_substep(step_idx, "❌ Audio non trovato", "failed")
+                        display_timeline(tracker, timeline_container)
+                        st.error("❌ Audio non trovato per calcolare le immagini.")
+                        st.stop()
                     duration_sec = mp3_duration_seconds(audio_path) or 60
                     num_images = max(1, int(duration_sec // seconds_per_img))
-                    
                     tracker.add_substep(step_idx, f"📊 Audio {duration_sec:.1f}s → {num_images} immagini", "completed")
-                    
+
                     if num_images == 1:
                         img_chunks = [script]
                     else:
@@ -737,70 +655,48 @@ if generate and title.strip() and script.strip():
                         for i in range(0, len(sentences), sentences_per_image):
                             chunk_sentences = sentences[i:i + sentences_per_image]
                             img_chunks.append(" ".join(chunk_sentences))
-                    
+
                     tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(img_chunks)} Immagini"
                     display_timeline(tracker, timeline_container)
-                    
-                    with debug_container:
-                        st.write(f"🔄 Chiamando generate_images() per {len(img_chunks)} immagini...")
-                    
-                    try:
-                        generate_images(img_chunks, runtime_cfg, img_dir)
-                        zip_images(base)
-                        tracker.complete_step(step_idx, "completed")
-                        
-                        with debug_container:
-                            st.write("✅ Immagini completate")
-                            
-                    except Exception as images_error:
-                        with debug_container:
-                            st.error(f"❌ ERRORE IMMAGINI: {images_error}")
-                            st.code(str(images_error))
-                        tracker.complete_step(step_idx, "failed")
-                        tracker.add_substep(step_idx, f"❌ Errore: {str(images_error)[:50]}", "failed")
-                        raise images_error
-            else:
-                groups = chunk_by_sentences_count(script, int(sentences_per_image))
-                tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi di {int(sentences_per_image)} frasi", "completed")
-                tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
-                display_timeline(tracker, timeline_container)
-                
-                with debug_container:
-                    st.write(f"🔄 Chiamando generate_images() per {len(groups)} immagini...")
-                
-                try:
-                    generate_images(groups, runtime_cfg, img_dir)
+
+                    generate_images(img_chunks, runtime_cfg, img_dir, progress_cb=_progress)
                     zip_images(base)
                     tracker.complete_step(step_idx, "completed")
-                    
                     with debug_container:
                         st.write("✅ Immagini completate")
-                        
-                except Exception as images_error:
+                else:
+                    groups = chunk_by_sentences_count(script, int(sentences_per_image))
+                    tracker.add_substep(step_idx, f"📝 Creati {len(groups)} gruppi di {int(sentences_per_image)} frasi", "completed")
+                    tracker.steps[step_idx]["description"] = f"🖼️ Generazione {len(groups)} Immagini"
+                    display_timeline(tracker, timeline_container)
+
+                    generate_images(groups, runtime_cfg, img_dir, progress_cb=_progress)
+                    zip_images(base)
+                    tracker.complete_step(step_idx, "completed")
                     with debug_container:
-                        st.error(f"❌ ERRORE IMMAGINI: {images_error}")
-                        st.code(str(images_error))
-                    tracker.complete_step(step_idx, "failed")
-                    tracker.add_substep(step_idx, f"❌ Errore: {str(images_error)[:50]}", "failed")
-                    raise images_error
-            
+                        st.write("✅ Immagini completate")
+            except Exception as images_error:
+                with debug_container:
+                    st.error(f"❌ ERRORE IMMAGINI: {images_error}")
+                tracker.complete_step(step_idx, "failed")
+                tracker.add_substep(step_idx, f"❌ Errore: {str(images_error)[:80]}", "failed")
+                raise
+
             display_timeline(tracker, timeline_container)
 
         # Finalizzazione
         with debug_container:
             st.write("🎉 **Finalizzando...**")
-        
         final_step = tracker.add_step("finalize", "🎉 Finalizzazione e Packaging")
         display_timeline(tracker, timeline_container)
-        
-        # Salva percorsi per download
+
         files_created = []
         if os.path.exists(audio_path):
             st.session_state["audio_path"] = audio_path
             st.session_state["audio_ready"] = True
             files_created.append("Audio MP3")
             tracker.add_substep(final_step, "💾 Audio MP3 salvato", "completed")
-        
+
         zip_path = os.path.join(base, "output.zip")
         if os.path.exists(zip_path):
             st.session_state["zip_path"] = zip_path
@@ -810,57 +706,54 @@ if generate and title.strip() and script.strip():
 
         tracker.complete_step(final_step, "completed")
         tracker.steps[final_step]["description"] = f"🎉 Completato! Files: {', '.join(files_created)}"
-        
-        # Timeline finale
         display_timeline(tracker, timeline_container)
-        
-        # Celebrazione
+
         total_time = tracker.get_elapsed_time()
         st.balloons()
         st.success(f"✅ **Generazione completata in {total_time/60:.1f} minuti!**")
-        
-        with debug_container:
-            st.write("🎉 **TUTTO COMPLETATO CON SUCCESSO!**")
 
         # Summary dettagliato
         with st.expander("📊 Statistiche Dettagliate", expanded=True):
             col1, col2, col3 = st.columns(3)
-            
             with col1:
                 st.metric("⏱️ Tempo Totale", f"{total_time/60:.1f} min")
-                if aud_chunks:
-                    audio_time = sum(s["duration"] or 0 for s in tracker.steps if s["type"] == "audio")
-                    st.metric("🎧 Tempo Audio", f"{audio_time/60:.1f} min")
-            
+                audio_steps = [s for s in tracker.steps if s["type"] == "audio" and s.get("duration")]
+                if audio_steps:
+                    st.metric("🎧 Tempo Audio", f"{sum(s['duration'] for s in audio_steps)/60:.1f} min")
             with col2:
                 completed_steps = len([s for s in tracker.steps if s["status"] == "completed"])
                 st.metric("✅ Step Completati", f"{completed_steps}/{len(tracker.steps)}")
-                if estimated_images > 0:
-                    image_time = sum(s["duration"] or 0 for s in tracker.steps if s["type"] == "images")
-                    st.metric("🖼️ Tempo Immagini", f"{image_time/60:.1f} min")
-            
+                image_steps = [s for s in tracker.steps if s["type"] == "images" and s.get("duration")]
+                if image_steps:
+                    st.metric("🖼️ Tempo Immagini", f"{sum(s['duration'] for s in image_steps)/60:.1f} min")
             with col3:
                 if aud_chunks:
                     st.metric("🎵 Chunk Audio", len(aud_chunks))
-                if estimated_images > 0:
-                    st.metric("🎨 Immagini", estimated_images)
+                if mode in ["Immagini", "Entrambi"]:
+                    try:
+                        import zipfile
+                        with zipfile.ZipFile(zip_path, 'r') as zf:
+                            files = [f for f in zf.namelist() if f.endswith(('.png', '.jpg', '.jpeg'))]
+                            st.metric("🎨 Immagini", len(files))
+                    except Exception:
+                        pass
 
     except Exception as e:
         with debug_container:
             st.error(f"💥 **ERRORE PRINCIPALE**: {e}")
             import traceback
             st.code(traceback.format_exc())
-        
+
         if 'tracker' in locals() and tracker.current_step is not None:
             tracker.complete_step(tracker.current_step, "failed")
             tracker.add_substep(tracker.current_step, f"❌ Errore: {str(e)[:100]}", "failed")
             display_timeline(tracker, timeline_container)
-        
+
         st.error(f"❌ Errore durante generazione: {e}")
         with st.expander("🔍 Dettagli Errore Completi", expanded=True):
             import traceback
             st.code(traceback.format_exc())
-    
+
     finally:
         st.session_state["is_generating"] = False
         with debug_container:
@@ -872,7 +765,6 @@ if generate and title.strip() and script.strip():
 st.divider()
 st.subheader("📥 Download Files")
 
-# Layout a colonne per download
 download_col1, download_col2 = st.columns(2)
 
 with download_col1:
@@ -880,12 +772,10 @@ with download_col1:
     if st.session_state.get("audio_ready") and st.session_state.get("audio_path"):
         audio_path = st.session_state["audio_path"]
         if os.path.exists(audio_path):
-            # Info dettagliate file audio
             try:
                 size_mb = os.path.getsize(audio_path) / (1024*1024)
                 duration = mp3_duration_seconds(audio_path)
                 bitrate = (size_mb * 8 * 1024) / duration if duration > 0 else 0
-                
                 st.info(f"""
                 📊 **Dettagli Audio:**
                 - Durata: {duration:.1f}s ({duration/60:.1f} min)
@@ -894,13 +784,11 @@ with download_col1:
                 """)
             except:
                 st.info("📊 File audio disponibile")
-                
-            # Download button
             with open(audio_path, "rb") as f:
                 st.download_button(
-                    "🎧 Scarica Audio MP3", 
+                    "🎧 Scarica Audio MP3",
                     f.read(),
-                    file_name=f"{sanitize(title or 'audio')}.mp3", 
+                    file_name=f"{sanitize(st.session_state.get('title') or 'audio')}.mp3",
                     mime="audio/mpeg",
                     key="download-audio-main",
                     use_container_width=True
@@ -916,17 +804,13 @@ with download_col2:
     if st.session_state.get("zip_ready") and st.session_state.get("zip_path"):
         zip_path = st.session_state["zip_path"]
         if os.path.exists(zip_path):
-            # Info dettagliate ZIP
             try:
                 size_mb = os.path.getsize(zip_path) / (1024*1024)
                 import zipfile
                 with zipfile.ZipFile(zip_path, 'r') as zf:
                     files = [f for f in zf.namelist() if f.endswith(('.png', '.jpg', '.jpeg'))]
                     img_count = len(files)
-                    
-                    # Calcola dimensione media per immagine
                     avg_size_mb = size_mb / img_count if img_count > 0 else 0
-                
                 st.info(f"""
                 📊 **Dettagli Immagini:**
                 - Numero: {img_count} immagini
@@ -935,13 +819,11 @@ with download_col2:
                 """)
             except:
                 st.info("📊 ZIP immagini disponibile")
-                
-            # Download button  
             with open(zip_path, "rb") as f:
                 st.download_button(
-                    "🖼️ Scarica ZIP Immagini", 
+                    "🖼️ Scarica ZIP Immagini",
                     f.read(),
-                    file_name=f"{sanitize(title or 'images')}.zip", 
+                    file_name=f"{sanitize(st.session_state.get('title') or 'images')}.zip",
                     mime="application/zip",
                     key="download-zip-main",
                     use_container_width=True
@@ -955,7 +837,6 @@ with download_col2:
 # Controlli download
 st.markdown("---")
 col_clear, col_info = st.columns([1, 2])
-
 with col_clear:
     if st.session_state.get("audio_ready") or st.session_state.get("zip_ready"):
         if st.button("🗑️ Pulisci Download", help="Rimuove i file dalla lista download", use_container_width=True, key="clear_downloads_btn"):
@@ -965,7 +846,6 @@ with col_clear:
             st.session_state.pop("zip_path", None)
             st.success("🗑️ Download puliti!")
             st.rerun()
-
 with col_info:
     if st.session_state.get("audio_ready") or st.session_state.get("zip_ready"):
         st.info("💡 I file rimangono disponibili fino a quando non premi 'Pulisci Download' o riavvii l'app")
@@ -976,17 +856,8 @@ with col_info:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
-    🎬 <strong>Generatore Video AI</strong> | 
-    Powered by Replicate + FishAudio | 
+    🎬 <strong>Generatore Video AI</strong> |
+    Powered by Replicate + FishAudio |
     Timeline real-time + Sistema Resume integrati
 </div>
 """, unsafe_allow_html=True)
-# Dopo generazione audio
-with open(audio_output_path, "wb") as f:
-    f.write(audio_response.read())  # salva subito il file sul disco
-save_checkpoint(step="audio", data={"audio_output_path": audio_output_path})
-
-# Dopo generazione immagine
-with open(image_path, "wb") as f:
-    f.write(image_response.read())
-save_checkpoint(step="image", data={"image_path": image_path})

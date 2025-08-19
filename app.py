@@ -2,12 +2,18 @@
 # -------------------------------------------------------
 # Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
 # Compatibile con Python 3.13: niente pydub; usiamo mutagen + ffmpeg via imageio-ffmpeg.
+# Con ripresa progressi AUDIO (resume): salva manifest + chunk MP3 numerati.
 # -------------------------------------------------------
 
 import os
 import re
 import time
+import json
+import hashlib
+import shutil
 import textwrap
+import tempfile
+import subprocess
 import requests
 import streamlit as st
 
@@ -20,13 +26,20 @@ except Exception:
 from scripts.utils import (
     chunk_text,
     chunk_by_sentences_count,
-    generate_audio,
+    generate_audio,       # lo riusiamo per generare un singolo chunk alla volta
     generate_images,
-    mp3_duration_seconds,  # util per leggere durata MP3
+    mp3_duration_seconds, # util per leggere durata MP3
 )
 
+# imageio-ffmpeg per trovare ffmpeg
+try:
+    import imageio_ffmpeg
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_EXE = "ffmpeg"  # fallback: deve essere nel PATH
+
 # ---------------------------
-# Utility
+# Utility di base
 # ---------------------------
 def sanitize(title: str) -> str:
     s = (title or "").lower()
@@ -42,7 +55,7 @@ def zip_images(base_dir: str):
     if not os.path.exists(img_dir):
         return None
     with zipfile.ZipFile(zip_path, "w") as zipf:
-        for filename in os.listdir(img_dir):
+        for filename in sorted(os.listdir(img_dir)):
             full_path = os.path.join(img_dir, filename)
             if os.path.isfile(full_path):
                 zipf.write(full_path, arcname=os.path.join("images", filename))
@@ -55,27 +68,24 @@ def _mask(tok: str) -> str:
     t = (tok or "").strip()
     return t[:3] + "…" + t[-4:] if len(t) > 8 else "—"
 
+def script_hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
 # ---------------------------
-# Nuovo: chunking per AUDIO a ~2000 caratteri spezzando sui punti
+# Split testo per AUDIO a ~2000 caratteri spezzando sui punti
 # ---------------------------
 def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
     """
     Divide il testo in blocchi di circa max_chars caratteri,
-    cercando di spezzare dopo i punti ('.', '!', '?').
-    Se una singola frase supera max_chars, la spezza "duramente".
-    Ritorna: lista[str]
+    spezzando dopo . ! ? dove possibile.
+    Se una singola frase supera max_chars, la spezza duramente.
     """
-    # Normalizza spazi
     t = re.sub(r"\s+", " ", (text or "").strip())
     if not t:
         return []
 
-    # Split per frasi in base a ., !, ?
-    # (manteniamo la punteggiatura con lookbehind)
     sentences = re.split(r"(?<=[\.\!\?])\s+", t)
-
-    chunks = []
-    acc = ""
+    chunks, acc = [], ""
 
     def flush_acc():
         nonlocal acc
@@ -88,34 +98,213 @@ def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
         if not s:
             continue
 
-        # Se una singola frase è più lunga del limite, spezzala duramente
         if len(s) > max_chars:
-            # Prima chiudi l'accumulatore se non è vuoto
             flush_acc()
-            # Spezza la frase lunga in sottoparti <= max_chars
             parts = textwrap.wrap(s, width=max_chars, break_long_words=True, break_on_hyphens=False)
             chunks.extend([p.strip() for p in parts if p.strip()])
             continue
 
-        # Se la frase ci sta nell'acc corrente, aggiungila
-        if not acc:
-            new_len = len(s)
-        else:
-            new_len = len(acc) + 1 + len(s)  # +1 per lo spazio
-
+        new_len = len(s) if not acc else len(acc) + 1 + len(s)
         if new_len <= max_chars:
-            acc = (s if not acc else f"{acc} {s}")
+            acc = s if not acc else f"{acc} {s}"
         else:
-            # Chiudi il chunk corrente e riparti con la nuova frase
             flush_acc()
             acc = s
 
-    # Aggiungi l'ultimo accumulatore
     flush_acc()
+    return [c for c in chunks if c]
 
-    # Filtro finale per eliminare eventuali vuoti
-    chunks = [c for c in chunks if c]
-    return chunks
+# ---------------------------
+# Manifest + concat MP3
+# ---------------------------
+def manifest_path(aud_dir: str) -> str:
+    return os.path.join(aud_dir, "audio_manifest.json")
+
+def load_manifest(aud_dir: str) -> dict | None:
+    p = manifest_path(aud_dir)
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+def save_manifest(aud_dir: str, data: dict) -> None:
+    p = manifest_path(aud_dir)
+    tmp = p + ".tmp"
+    os.makedirs(aud_dir, exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+def chunk_filename(aud_dir: str, idx: int) -> str:
+    return os.path.join(aud_dir, f"chunk_{idx:04d}.mp3")
+
+def concat_mp3_chunks(aud_dir: str, out_path: str, total_chunks: int) -> bool:
+    """
+    Concatena con ffmpeg (demuxer concat). Richiede che tutti i chunk
+    abbiano codec/parametri compatibili (vero per stesso TTS).
+    """
+    if total_chunks <= 0:
+        return False
+    list_file = os.path.join(aud_dir, "concat_list.txt")
+    with open(list_file, "w", encoding="utf-8") as f:
+        for i in range(total_chunks):
+            f.write(f"file '{chunk_filename(aud_dir, i).replace('\'','\\'')}'\n")
+    # Esegui ffmpeg
+    cmd = [
+        FFMPEG_EXE, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", list_file,
+        "-c", "copy",
+        out_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except subprocess.CalledProcessError as e:
+        # fallback: ricodifica (più lento ma robusto)
+        cmd = [
+            FFMPEG_EXE, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", list_file,
+            "-acodec", "mp3",
+            "-ar", "44100",
+            "-ab", "192k",
+            out_path
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+        except Exception:
+            return False
+
+# ---------------------------
+# Sintesi di UN chunk riusando scripts.utils.generate_audio
+# ---------------------------
+def synthesize_single_chunk(text_chunk: str, runtime_cfg: dict, aud_dir: str, idx: int) -> str | None:
+    """
+    Genera un singolo chunk audio riusando generate_audio su una cartella temporanea,
+    poi rinomina il risultato a chunk_{idx:04d}.mp3 nell'aud_dir.
+    """
+    # cartella temp isolata per evitare collisioni
+    tmp_out = os.path.join(aud_dir, f"_tmp_chunk_{idx:04d}")
+    os.makedirs(tmp_out, exist_ok=True)
+    try:
+        # Passiamo una lista con un solo pezzo
+        result_path = generate_audio([text_chunk], runtime_cfg, tmp_out)
+        if not result_path or not os.path.exists(result_path):
+            return None
+        # Copia/sposta in percorso definitivo
+        dest = chunk_filename(aud_dir, idx)
+        os.replace(result_path, dest)  # atomic move
+        # pulizia
+        try:
+            shutil.rmtree(tmp_out, ignore_errors=True)
+        except Exception:
+            pass
+        return dest
+    except Exception:
+        try:
+            shutil.rmtree(tmp_out, ignore_errors=True)
+        except Exception:
+            pass
+        return None
+
+# ---------------------------
+# Generazione AUDIO con resume
+# ---------------------------
+def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str, max_chars: int = 2000) -> str | None:
+    """
+    1) Crea i chunk del testo (~2000 char).
+    2) Salva/legge un manifest per il resume.
+    3) Genera ogni chunk come MP3 separato (chunk_0000.mp3, ...).
+    4) Concatena tutto in combined_audio.mp3.
+    Ritorna il percorso dell'MP3 finale oppure None.
+    """
+    os.makedirs(aud_dir, exist_ok=True)
+    # Chunking deterministico
+    chunks = split_text_into_sentence_chunks(script_text, max_chars=max_chars)
+    total = len(chunks)
+
+    if total == 0:
+        return None
+
+    # Carica/crea manifest
+    m = load_manifest(aud_dir) or {}
+    cur_hash = script_hash(script_text)
+    expected = {
+        "version": 1,
+        "script_hash": cur_hash,
+        "max_chars": max_chars,
+        "total_chunks": total,
+        "completed": [],  # indici completati
+    }
+
+    # Se esiste ma non combacia (hash o max_chars o numero), resettiamo (nuova run)
+    if not m or (
+        m.get("script_hash") != cur_hash or
+        int(m.get("max_chars", -1)) != max_chars or
+        int(m.get("total_chunks", -1)) != total
+    ):
+        m = expected
+        save_manifest(aud_dir, m)
+    else:
+        # Normalizza completed
+        m["completed"] = sorted(set(int(i) for i in m.get("completed", []) if 0 <= int(i) < total))
+        save_manifest(aud_dir, m)
+
+    # Riprendi: salta chunk già presenti su disco o segnati completed
+    # (Se un file esiste ma non è segnato, lo segniamo)
+    completed = set(m.get("completed", []))
+    for i in range(total):
+        f = chunk_filename(aud_dir, i)
+        if os.path.exists(f):
+            completed.add(i)
+    m["completed"] = sorted(completed)
+    save_manifest(aud_dir, m)
+
+    # UI progress
+    st.caption(f"🎧 Audio: {total} chunk da generare (~{max_chars} caratteri ciascuno).")
+    prog = st.progress(len(completed) / total if total else 0.0)
+    status = st.empty()
+
+    # Loop di generazione
+    for i, piece in enumerate(chunks):
+        if i in completed:
+            status.write(f"✅ Chunk {i+1}/{total} già presente, salto.")
+            prog.progress((len(completed)) / total)
+            continue
+
+        status.write(f"🎙️ Genero chunk {i+1}/{total} …")
+        out = synthesize_single_chunk(piece, runtime_cfg, aud_dir, i)
+        if out and os.path.exists(out):
+            completed.add(i)
+            m["completed"] = sorted(completed)
+            save_manifest(aud_dir, m)
+            prog.progress(len(completed) / total)
+        else:
+            st.error(f"❌ Errore nella generazione del chunk {i+1}. Puoi ripremere 'Genera contenuti' per riprendere.")
+            # interrompiamo lasciando i progressi salvati
+            return None
+
+    status.write("🔗 Concateno i chunk MP3 in un unico file…")
+    final_path = os.path.join(aud_dir, "combined_audio.mp3")
+    ok = concat_mp3_chunks(aud_dir, final_path, total_chunks=total)
+    if not ok:
+        st.error("❌ Concatenazione fallita. I chunk singoli sono comunque salvati.")
+        return None
+
+    # Verifica durata
+    try:
+        dur = mp3_duration_seconds(final_path)
+        st.caption(f"⏱️ Durata audio: ~{int(dur)}s")
+    except Exception:
+        pass
+
+    status.write("✅ Audio completo!")
+    return final_path
 
 # ---------------------------
 # Pagina
@@ -261,6 +450,13 @@ title = st.text_input("Titolo del video")
 script = st.text_area("Inserisci il testo da usare per generare immagini/audio", height=300)
 mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
 
+# Config chunking audio esposto per comodità
+max_chars_audio = st.number_input(
+    "Massimo caratteri per chunk audio",
+    min_value=500, max_value=8000, value=2000, step=100,
+    help="I chunk vengono spezzati dopo i punti dove possibile."
+)
+
 # Input condizionali
 if mode in ["Audio", "Entrambi"]:
     seconds_per_img = st.number_input(
@@ -322,7 +518,7 @@ if generate and title.strip() and script.strip():
         + "`"
     )
 
-    # ---- AUDIO ----
+    # ---- AUDIO (con resume) ----
     if mode in ["Audio", "Entrambi"]:
         if not fish_ok:
             st.error("❌ FishAudio API key mancante. Inseriscila nella sidebar.")
@@ -330,21 +526,14 @@ if generate and title.strip() and script.strip():
             st.error("❌ FishAudio Voice ID mancante. Inseriscilo nella sidebar.")
         else:
             st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
-            # 🔴 Modifica: Spezzetta in ~2000 caratteri, dopo i punti
-            aud_chunks = split_text_into_sentence_chunks(script, max_chars=2000)
-            if not aud_chunks:
-                st.error("⚠️ Testo vuoto dopo il pre-processing.")
-                st.stop()
-            # Opzionale: feedback
-            st.caption(f"Spezzettamento audio: creati {len(aud_chunks)} chunk (~2000 caratteri ciascuno).")
-            final_audio = generate_audio(aud_chunks, runtime_cfg, aud_dir)
+            final_audio = generate_audio_with_resume(script, runtime_cfg, aud_dir, max_chars=int(max_chars_audio))
             if final_audio:
                 audio_path = final_audio
             else:
-                st.error("⚠️ Audio non generato: controlla API key/voice/model nella sidebar.")
+                st.error("⚠️ Audio non completato: puoi ripremere 'Genera contenuti' per riprendere dai chunk mancanti.")
                 st.stop()
 
-    # ---- IMMAGINI ----
+    # ---- IMMAGINI (immutato) ----
     if mode in ["Immagini", "Entrambi"]:
         if not rep_ok:
             st.error("❌ Replicate API key mancante. Inseriscila nella sidebar.")

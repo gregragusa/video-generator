@@ -6,7 +6,8 @@
 # - Risoluzione automatica modello Replicate -> owner/name:version_id
 # - Download audio immediato appena pronto
 # - UI: scelta "Ogni quanti secondi" per immagini
-# - NEW: Resume IMMAGINI con manifest + img_XXXX.ext (non rigenera le già fatte)
+# - Resume IMMAGINI con manifest + img_XXXX.ext (non rigenera le già fatte)
+# - NEW: Prompt fisso per ogni immagine (before/after)
 # -------------------------------------------------------
 
 import os
@@ -396,7 +397,7 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: Dict[str, Any], au
     return final_path
 
 # ---------------------------
-# IMMAGINI: helpers + resume
+# IMMAGINI: helpers + resume + prompt fisso
 # ---------------------------
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
@@ -425,6 +426,16 @@ def _image_existing_path(img_dir: str, idx: int) -> Optional[str]:
             return p
     return None
 
+def combined_image_prompt(content: str, fixed: str, position: str) -> str:
+    """Combina il testo del chunk con il prompt fisso (prima/dopo)."""
+    fixed = (fixed or "").strip()
+    content = (content or "").strip()
+    if not fixed:
+        return content
+    if (position or "after").lower().startswith("before"):
+        return f"{fixed}\n\n{content}".strip()
+    return f"{content}\n\n{fixed}".strip()
+
 def synthesize_single_image(text_chunk: str, runtime_cfg: Dict[str, Any], img_dir: str, idx: int) -> Optional[str]:
     """
     Genera UNA immagine per il chunk dato, usando generate_images([chunk]) in una cartella temporanea,
@@ -433,7 +444,6 @@ def synthesize_single_image(text_chunk: str, runtime_cfg: Dict[str, Any], img_di
     tmp_out = os.path.join(img_dir, f"_tmp_img_{idx:04d}")
     os.makedirs(tmp_out, exist_ok=True)
     try:
-        # generiamo esattamente 1 immagine passando lista con un solo chunk
         generate_images([text_chunk], runtime_cfg, tmp_out)
         produced = _find_first_image_file(tmp_out)
         if not produced:
@@ -443,7 +453,6 @@ def synthesize_single_image(text_chunk: str, runtime_cfg: Dict[str, Any], img_di
         if ext not in IMG_EXTS:
             ext = ".png"  # fallback
         dest = os.path.join(img_dir, f"img_{idx:04d}{ext}")
-        # se esiste già qualcosa per quell'indice, sovrascrivi in modo atomico
         os.replace(produced, dest)
         shutil.rmtree(tmp_out, ignore_errors=True)
         return dest
@@ -454,9 +463,8 @@ def synthesize_single_image(text_chunk: str, runtime_cfg: Dict[str, Any], img_di
 def generate_images_with_resume(img_chunks: List[str], img_dir: str, resume_key: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> bool:
     """
     Resume per IMMAGINI.
-    - img_chunks: lista dei testi per ogni immagine da generare (ordine stabile).
-    - resume_key: {script_hash, strategy, param_value, total_images}
-      strategy in {"by_seconds", "by_sentences"} per distinguere layout diversi.
+    - img_chunks: lista dei testi (già combinati con prompt fisso) per ogni immagine da generare.
+    - resume_key: {script_hash, strategy, param_value, total_images, fixed_prompt_hash, fixed_prompt_position}
     """
     os.makedirs(img_dir, exist_ok=True)
     total = len(img_chunks)
@@ -467,18 +475,22 @@ def generate_images_with_resume(img_chunks: List[str], img_dir: str, resume_key:
     m = load_manifest(m_path) or {}
 
     expected = {
-        "version": 1,
+        "version": 2,
         "script_hash": resume_key.get("script_hash"),
         "strategy": resume_key.get("strategy"),
         "param_value": int(resume_key.get("param_value", 0)),
         "total_images": total,
+        "fixed_prompt_hash": resume_key.get("fixed_prompt_hash") or "",
+        "fixed_prompt_position": resume_key.get("fixed_prompt_position") or "after",
         "completed": [],
     }
 
-    # reset se mismatch (nuovo testo / diversa strategia / diverso N immagini)
+    # reset se mismatch (nuovo testo / diversa strategia / diverso N immagini / prompt fisso cambiato)
     if (not m or
         m.get("script_hash") != expected["script_hash"] or
         m.get("strategy") != expected["strategy"] or
+        (m.get("fixed_prompt_hash") or "") != expected["fixed_prompt_hash"] or
+        (m.get("fixed_prompt_position") or "after") != expected["fixed_prompt_position"] or
         int(m.get("param_value", -1)) != expected["param_value"] or
         int(m.get("total_images", -1)) != total):
         m = expected
@@ -515,7 +527,6 @@ def generate_images_with_resume(img_chunks: List[str], img_dir: str, resume_key:
             prog.progress(len(completed) / total)
         else:
             st.error(f"❌ Errore immagine {i+1}. Puoi ripremere 'Genera contenuti' per riprendere dai mancanti.")
-            # non abortiamo del tutto: salviamo stato e fermiamo qui
             return False
 
     status.write("✅ Immagini completate!")
@@ -737,6 +748,24 @@ else:  # Solo Immagini
     )
     st.session_state["sentences_per_image"] = int(sentences_per_image)
 
+# 🎨 NEW: Prompt fisso per ogni immagine
+fixed_image_prompt = st.text_area(
+    "Prompt fisso per ogni immagine (opzionale)",
+    value=st.session_state.get("fixed_image_prompt", ""),
+    help="Esempio: 'Epoca dell'antica Roma nell'anno 200 d.C. Usa uno stile ultra realistico.'"
+)
+st.session_state["fixed_image_prompt"] = fixed_image_prompt
+
+fixed_prompt_position = st.radio(
+    "Dove inserire il prompt fisso?",
+    options=["Dopo il testo del chunk", "Prima del testo del chunk"],
+    index=0 if st.session_state.get("fixed_image_prompt_position", "after") == "after" else 1,
+    horizontal=True
+)
+# normalizza in 'after' | 'before'
+fixed_pos_norm = "after" if fixed_prompt_position.startswith("Dopo") else "before"
+st.session_state["fixed_image_prompt_position"] = fixed_pos_norm
+
 generate = st.button("🚀 Genera contenuti")
 
 # ===========================
@@ -820,13 +849,16 @@ if generate and title.strip() and script.strip():
                 st.error("⚠️ Audio non completato. Premi di nuovo 'Genera contenuti' per rigenerare eventuali chunk rotti e riprovare la concat.")
                 st.stop()
 
-    # ---- IMMAGINI (con resume) ----
+    # ---- IMMAGINI (con resume + prompt fisso) ----
     if mode in ["Immagini", "Entrambi"]:
         if not rep_ok:
             st.error("❌ Replicate API key mancante. Inseriscila nella sidebar.")
         elif not runtime_cfg.get("replicate_model"):
             st.error("❌ Modello Replicate mancante o non risolto.")
         else:
+            fixed = st.session_state.get("fixed_image_prompt", "") or ""
+            fixed_pos = st.session_state.get("fixed_image_prompt_position", "after")
+
             if mode == "Entrambi":
                 if not os.path.exists(audio_path):
                     st.error("❌ Audio non trovato per calcolare le immagini. Genera prima l’audio.")
@@ -841,12 +873,16 @@ if generate and title.strip() and script.strip():
                         duration_sec = 60  # fallback
                     num_images = max(1, int(duration_sec // max(1, secs)))
                     approx_chars = max(1, len(script) // max(1, num_images))
-                    img_chunks = chunk_text(script, approx_chars)
+                    base_chunks = chunk_text(script, approx_chars)
+                    # applica prompt fisso
+                    img_chunks = [combined_image_prompt(c, fixed, fixed_pos) for c in base_chunks]
 
                     resume_key = {
-                        "script_hash": script_hash(script),
+                        "script_hash": script_hash(script + "||" + fixed + "||" + fixed_pos),
                         "strategy": "by_seconds",
                         "param_value": secs,
+                        "fixed_prompt_hash": script_hash(fixed),
+                        "fixed_prompt_position": fixed_pos,
                     }
                     ok_imgs = generate_images_with_resume(img_chunks, img_dir, resume_key, runtime_cfg)
                     if ok_imgs:
@@ -854,14 +890,17 @@ if generate and title.strip() and script.strip():
             else:
                 spi = int(st.session_state.get("sentences_per_image", 2)) or 2
                 st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (1 ogni {spi} frasi)…")
-                groups = chunk_by_sentences_count(script, spi)
+                base_groups = chunk_by_sentences_count(script, spi)
+                img_chunks = [combined_image_prompt(c, fixed, fixed_pos) for c in base_groups]
 
                 resume_key = {
-                    "script_hash": script_hash(script),
+                    "script_hash": script_hash(script + "||" + fixed + "||" + fixed_pos),
                     "strategy": "by_sentences",
                     "param_value": spi,
+                    "fixed_prompt_hash": script_hash(fixed),
+                    "fixed_prompt_position": fixed_pos,
                 }
-                ok_imgs = generate_images_with_resume(groups, img_dir, resume_key, runtime_cfg)
+                ok_imgs = generate_images_with_resume(img_chunks, img_dir, resume_key, runtime_cfg)
                 if ok_imgs:
                     zip_images(base)
 

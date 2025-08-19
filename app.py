@@ -7,6 +7,7 @@
 import os
 import re
 import time
+import textwrap
 import requests
 import streamlit as st
 
@@ -53,6 +54,68 @@ def _clean_token(tok: str) -> str:
 def _mask(tok: str) -> str:
     t = (tok or "").strip()
     return t[:3] + "…" + t[-4:] if len(t) > 8 else "—"
+
+# ---------------------------
+# Nuovo: chunking per AUDIO a ~2000 caratteri spezzando sui punti
+# ---------------------------
+def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
+    """
+    Divide il testo in blocchi di circa max_chars caratteri,
+    cercando di spezzare dopo i punti ('.', '!', '?').
+    Se una singola frase supera max_chars, la spezza "duramente".
+    Ritorna: lista[str]
+    """
+    # Normalizza spazi
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    if not t:
+        return []
+
+    # Split per frasi in base a ., !, ?
+    # (manteniamo la punteggiatura con lookbehind)
+    sentences = re.split(r"(?<=[\.\!\?])\s+", t)
+
+    chunks = []
+    acc = ""
+
+    def flush_acc():
+        nonlocal acc
+        if acc.strip():
+            chunks.append(acc.strip())
+        acc = ""
+
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+
+        # Se una singola frase è più lunga del limite, spezzala duramente
+        if len(s) > max_chars:
+            # Prima chiudi l'accumulatore se non è vuoto
+            flush_acc()
+            # Spezza la frase lunga in sottoparti <= max_chars
+            parts = textwrap.wrap(s, width=max_chars, break_long_words=True, break_on_hyphens=False)
+            chunks.extend([p.strip() for p in parts if p.strip()])
+            continue
+
+        # Se la frase ci sta nell'acc corrente, aggiungila
+        if not acc:
+            new_len = len(s)
+        else:
+            new_len = len(acc) + 1 + len(s)  # +1 per lo spazio
+
+        if new_len <= max_chars:
+            acc = (s if not acc else f"{acc} {s}")
+        else:
+            # Chiudi il chunk corrente e riparti con la nuova frase
+            flush_acc()
+            acc = s
+
+    # Aggiungi l'ultimo accumulatore
+    flush_acc()
+
+    # Filtro finale per eliminare eventuali vuoti
+    chunks = [c for c in chunks if c]
+    return chunks
 
 # ---------------------------
 # Pagina
@@ -188,7 +251,7 @@ rep_model = get_replicate_model() or "—"
 voice_id = get_fishaudio_voice_id() or "—"
 st.write(
     f"🔎 Stato API → Replicate: {'✅' if rep_ok else '⚠️'} · FishAudio: {'✅' if fish_ok else '⚠️'} · "
-    f"Model(Immagini): ⁠ {rep_model} ⁠ · VoiceID(Audio): ⁠ {voice_id} ⁠"
+    f"Model(Immagini): ⁠ {rep_model} ⁠ · VoiceID(Audio): ⁠ {voice_id} ⁠"
 )
 
 # ===========================
@@ -267,7 +330,13 @@ if generate and title.strip() and script.strip():
             st.error("❌ FishAudio Voice ID mancante. Inseriscilo nella sidebar.")
         else:
             st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
-            aud_chunks = chunk_text(script, 30000)  # adatta al tuo TTS se serve
+            # 🔴 Modifica: Spezzetta in ~2000 caratteri, dopo i punti
+            aud_chunks = split_text_into_sentence_chunks(script, max_chars=2000)
+            if not aud_chunks:
+                st.error("⚠️ Testo vuoto dopo il pre-processing.")
+                st.stop()
+            # Opzionale: feedback
+            st.caption(f"Spezzettamento audio: creati {len(aud_chunks)} chunk (~2000 caratteri ciascuno).")
             final_audio = generate_audio(aud_chunks, runtime_cfg, aud_dir)
             if final_audio:
                 audio_path = final_audio

@@ -5,7 +5,7 @@
 # - Concat MP3 robusta (WAV fallback) + validazione chunk
 # - Risoluzione automatica modello Replicate -> owner/name:version_id
 # - Download audio immediato appena pronto
-# Compatibile con Python >=3.10
+# - UI: scelta "Ogni quanti secondi" per immagini (ripristinata)
 # -------------------------------------------------------
 
 import os
@@ -165,10 +165,9 @@ def ffprobe_has_audio(path: str) -> bool:
     """True se il file ha almeno uno stream audio. Se ffprobe non esiste, fallback su size>0."""
     if not os.path.exists(path) or os.path.getsize(path) <= 0:
         return False
-    # prova ffprobe
     try:
         cmd = [
-            FFPROBE_EXE, "-v", "error",
+            os.environ.get("FFPROBE_EXE", FFPROBE_EXE), "-v", "error",
             "-select_streams", "a:0",
             "-show_entries", "stream=codec_type",
             "-of", "default=nk=1:nw=1",
@@ -426,15 +425,12 @@ def resolve_replicate_model_identifier(model_input: str, token: str) -> Tuple[Op
     mi = (model_input or "").strip()
     if not mi:
         return None, "Modello vuoto."
-    # se già include ":", si presume risolto
     if ":" in mi:
         parts = mi.split(":")
         if len(parts) == 2 and parts[0].count("/") == 1 and parts[1]:
             return mi, None
-        # formato strano
         return None, f"Formato modello non valido: {mi}"
 
-    # deve essere owner/name
     if mi.count("/") != 1:
         return None, f"Atteso 'owner/name' (facoltativo ':version'), ricevuto: {mi}"
 
@@ -447,7 +443,6 @@ def resolve_replicate_model_identifier(model_input: str, token: str) -> Tuple[Op
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
         if r.status_code == 200:
             data = r.json() or {}
-            # Replicate in alcuni casi espone default_version, in altri latest_version
             ver = (data.get("default_version") or data.get("latest_version") or {}).get("id")
             if not ver:
                 return None, f"Modello trovato ma senza version id: {mi}"
@@ -614,12 +609,23 @@ title = st.text_input("Titolo del video")
 script = st.text_area("Inserisci il testo da usare per generare immagini/audio", height=300)
 mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
 
-# Config chunking audio esposto per comodità
-max_chars_audio = st.number_input(
-    "Massimo caratteri per chunk audio",
-    min_value=500, max_value=8000, value=2000, step=100,
-    help="I chunk vengono spezzati dopo i punti dove possibile."
-)
+# ⚙️ UI ripristinata: seconds_per_img (visibile per Audio/Entrambi) o sentences_per_image
+if mode in ["Audio", "Entrambi"]:
+    seconds_per_img = st.number_input(
+        "Ogni quanti secondi di audio creare un'immagine?",
+        min_value=1,
+        value=int(st.session_state.get("seconds_per_img", 8)),
+        step=1
+    )
+    st.session_state["seconds_per_img"] = int(seconds_per_img)
+else:  # Solo Immagini
+    sentences_per_image = st.number_input(
+        "Ogni quante frasi creare un'immagine?",
+        min_value=1,
+        value=int(st.session_state.get("sentences_per_image", 2)),
+        step=1
+    )
+    st.session_state["sentences_per_image"] = int(sentences_per_image)
 
 generate = st.button("🚀 Genera contenuti")
 
@@ -663,7 +669,6 @@ if generate and title.strip() and script.strip():
             if ":" not in effective:
                 st.caption(f"🔁 Modello risolto automaticamente: `{resolved_model}`")
         else:
-            # Non blocco: passo comunque il testo originale, ma avviso (così vedi l'errore originale se persistente)
             runtime_cfg["replicate_model"] = effective
             st.warning(f"⚠️ Modello non risolto: {err}")
 
@@ -686,10 +691,10 @@ if generate and title.strip() and script.strip():
         if not fish_ok:
             st.error("❌ FishAudio API key mancante. Inseriscila nella sidebar.")
         elif not get_fishaudio_voice_id():
-            st.error("❌ FishAudio Voice ID mancante. Inseriscilo nella sidebar.")
+            st.error("❌ FishAudio Voice ID mancante. Inseriscila nella sidebar.")
         else:
             st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
-            final_audio = generate_audio_with_resume(script, runtime_cfg, aud_dir, max_chars=int(max_chars_audio))
+            final_audio = generate_audio_with_resume(script, runtime_cfg, aud_dir, max_chars=2000)
             if final_audio:
                 audio_path = final_audio
                 # ✅ Download immediato appena l'audio è pronto
@@ -716,20 +721,15 @@ if generate and title.strip() and script.strip():
                 if not os.path.exists(audio_path):
                     st.error("❌ Audio non trovato per calcolare le immagini. Genera prima l’audio.")
                 else:
-                    st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (tempo audio)…")
+                    secs = int(st.session_state.get("seconds_per_img", 8))  # usa valore scelto in UI
+                    st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (1 ogni {secs}s di audio)…")
                     try:
                         duration_sec = mp3_duration_seconds(audio_path)
                     except Exception:
                         duration_sec = 0
                     if not duration_sec:
                         duration_sec = 60  # fallback
-                    seconds_per_img = 8  # valore di default per 'Entrambi' se non impostato da UI precedente
-                    # Nel vecchio UI questo veniva letto prima; qui fissiamo 8 se non esiste in sessione
-                    try:
-                        seconds_per_img = int(st.session_state.get("seconds_per_img", 8))
-                    except Exception:
-                        pass
-                    num_images = max(1, int(duration_sec // max(1, seconds_per_img)))
+                    num_images = max(1, int(duration_sec // max(1, secs)))
                     approx_chars = max(1, len(script) // max(1, num_images))
                     img_chunks = chunk_text(script, approx_chars)
                     st.text(f"🖼️ Generazione di {len(img_chunks)} immagini…")
@@ -739,11 +739,10 @@ if generate and title.strip() and script.strip():
                     except Exception as e:
                         st.error(f"❌ Errore generazione immagini: {e}")
             else:
-                st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (per frasi)…")
-                # default 2 frasi per immagine, se non definito precedentemente
-                sentences_per_image = int(st.session_state.get("sentences_per_image", 2)) or 2
-                groups = chunk_by_sentences_count(script, sentences_per_image)
-                st.text(f"🖼️ Generazione di {len(groups)} immagini (1 ogni {int(sentences_per_image)} frasi)…")
+                spi = int(st.session_state.get("sentences_per_image", 2)) or 2
+                st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (1 ogni {spi} frasi)…")
+                groups = chunk_by_sentences_count(script, spi)
+                st.text(f"🖼️ Generazione di {len(groups)} immagini…")
                 try:
                     generate_images(groups, runtime_cfg, img_dir)
                     zip_images(base)

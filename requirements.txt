@@ -4,3 +4,11 @@ Pillow
 replicate
 mutagen
 imageio-ffmpeg
+streamlit>=1.30,<1.38
+requests>=2.31
+imageio-ffmpeg>=0.4.9
+Pillow>=9.5
+mutagen>=1.47
+replicate>=0.29.0
+tqdm>=4.66
+numpy>=1.26,<2.2

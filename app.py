@@ -6,6 +6,7 @@
 # - Download MP3 immediato
 # - Risoluzione modello Replicate -> owner/name:version_id
 # - 🔧 Compat shims per vecchie versioni di Streamlit (cache_data, radio horizontal)
+# - 🛡️ "Gabbia di sicurezza": l'app non crasha all'avvio, mostra lo stacktrace in pagina
 # -------------------------------------------------------
 
 import os
@@ -318,7 +319,7 @@ def concat_mp3_chunks_robust(script_chunks: List[str], runtime_cfg: Dict[str, An
 
 def generate_audio_with_resume(script_text: str, runtime_cfg: Dict[str, Any], aud_dir: str, max_chars: int = 2000) -> Optional[str]:
     chunks = split_text_into_sentence_chunks(script_text, max_chars=max_chars)
-    total = len(chunks); 
+    total = len(chunks)
     if total == 0: return None
     m_path = manifest_path_audio(aud_dir)
     m = load_manifest(m_path) or {}
@@ -476,304 +477,313 @@ def resolve_replicate_model_identifier(model_input: str, token: str) -> Tuple[Op
         return None, f"Errore chiamando Replicate: {e}"
 
 # ---------------------------
-# Pagina
+# MAIN APP (gabbia di sicurezza)
 # ---------------------------
-st.set_page_config(page_title="Generatore Video", page_icon="🎬", layout="centered")
-st.title("🎬 Generatore di Video con Immagini e Audio")
+def main():
+    st.set_page_config(page_title="Generatore Video", page_icon="🎬", layout="centered")
+    st.title("🎬 Generatore di Video con Immagini e Audio")
 
-# Se utils non è importato, mostriamo un avviso ma lasciamo aprire l'app
-if _utils_import_error:
-    st.warning("⚠️ Problema nel caricare `scripts.utils`. L'app si apre comunque; gli errori compariranno al momento della generazione.")
-    with st.expander("Dettagli import error"):
-        st.code(_utils_import_error, language="text")
+    # Se utils non è importato, avvisa ma non bloccare l'app
+    if _utils_import_error:
+        st.warning("⚠️ Problema nel caricare `scripts.utils`. L'app si apre comunque; gli errori compariranno al momento della generazione.")
+        with st.expander("Dettagli import error"):
+            st.code(_utils_import_error, language="text")
 
-# Carica config opzionale
-base_cfg: Dict[str, Any] = {}
-if load_config:
-    try:
-        loaded = load_config()
-        if isinstance(loaded, dict):
-            base_cfg = loaded
-    except Exception as e:
-        st.warning(f"Config opzionale non caricata: {e}")
-
-# ===========================
-# 🔐 & ⚙️ Sidebar: API + Parametri
-# ===========================
-with st.sidebar:
-    st.header("🔐 API Keys")
-    st.caption("Le chiavi valgono solo per *questa sessione* del browser.")
-
-    rep_prefill = st.session_state.get("replicate_api_key", "")
-    fish_prefill = st.session_state.get("fish_audio_api_key", "")
-
-    with st.form("api_keys_form", clear_on_submit=False):
-        replicate_key = st.text_input("Replicate API key", type="password", value=rep_prefill, placeholder="r8_********")
-        fish_key = st.text_input("FishAudio API key", type="password", value=fish_prefill, placeholder="fa_********")
-        save_keys = st.form_submit_button("💾 Save")
-
-    if save_keys:
-        st.session_state["replicate_api_key"] = replicate_key.strip()
-        st.session_state["fish_audio_api_key"] = fish_key.strip()
-        st.success("Chiavi salvate nella sessione!")
-
-    st.subheader("🔎 Verifica token Replicate")
-    if st.button("Verifica token"):
-        tok = _clean_token(st.session_state.get("replicate_api_key", ""))
-        if not tok:
-            st.error("Nessun token Replicate inserito.")
-        else:
-            try:
-                r = requests.get("https://api.replicate.com/v1/account",
-                                 headers={"Authorization": f"Bearer {tok}"}, timeout=15)
-                if r.status_code == 200:
-                    who = r.json()
-                    st.success(f"✅ Token valido. Utente: {who.get('username','?')}")
-                else:
-                    st.error(f"❌ Token NON valido. HTTP {r.status_code}: {r.text[:200]}")
-            except Exception as e:
-                st.error(f"❌ Errore chiamando l’API: {e}")
-
-    st.divider()
-    st.header("⚙️ Parametri generazione")
-
-    # FishAudio Voice ID
-    voice_prefill = st.session_state.get("fishaudio_voice_id", "")
-    fish_voice_id = st.text_input("FishAudio Voice ID", value=voice_prefill, placeholder="es. voice_123abc...")
-    if fish_voice_id != voice_prefill:
-        st.session_state["fishaudio_voice_id"] = fish_voice_id.strip()
-
-    # Modello Replicate (preset + custom)
-    model_presets = [
-        "black-forest-labs/flux-schnell",
-        "black-forest-labs/flux-1.1",
-        "stability-ai/sdxl",
-        "scenario/anything-v4.5",
-        "Custom (digita sotto)",
-    ]
-    preset_selected = st.selectbox("Modello Replicate (image generator)", model_presets, index=0)
-
-    custom_prefill = st.session_state.get("replicate_model_custom", "")
-    custom_model = st.text_input("Custom model (owner/name:tag oppure owner/name)",
-                                 value=custom_prefill,
-                                 placeholder="es. black-forest-labs/flux-1.1")
-    if custom_model != custom_prefill:
-        st.session_state["replicate_model_custom"] = custom_model.strip()
-
-    effective_model = (st.session_state.get("replicate_model_custom", "").strip()
-                       if preset_selected == "Custom (digita sotto)" else preset_selected)
-    st.session_state["replicate_model"] = effective_model
-
-    if st.button("Verifica modello Replicate"):
-        tok = _clean_token(st.session_state.get("replicate_api_key", ""))
-        resolved, err = resolve_replicate_model_identifier(effective_model, tok)
-        if resolved: st.success(f"✅ Modello utilizzabile: `{resolved}`")
-        else: st.error(f"❌ Modello non utilizzabile: {err}")
-
-# Funzioni per recuperare stati
-def get_replicate_key() -> str:
-    return (st.session_state.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN", "")).strip()
-def get_fishaudio_key() -> str:
-    return (st.session_state.get("fish_audio_api_key") or os.environ.get("FISHAUDIO_API_KEY", "")).strip()
-def get_fishaudio_voice_id() -> str:
-    return (st.session_state.get("fishaudio_voice_id", "")).strip()
-def get_replicate_model() -> str:
-    return (st.session_state.get("replicate_model", "")).strip()
-
-# Badge di stato
-rep_ok = bool(get_replicate_key())
-fish_ok = bool(get_fishaudio_key())
-rep_model = get_replicate_model() or "—"
-voice_id = get_fishaudio_voice_id() or "—"
-st.write(f"🔎 Stato API → Replicate: {'✅' if rep_ok else '⚠️'} · FishAudio: {'✅' if fish_ok else '⚠️'} · "
-         f"Model(Immagini): {rep_model} · VoiceID(Audio): {voice_id}")
-
-# ===========================
-# 🎛️ Parametri generazione (centrale)
-# ===========================
-title = st.text_input("Titolo del video")
-script = st.text_area("Inserisci il testo da usare per generare immagini/audio", height=300)
-mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
-
-if mode in ["Audio", "Entrambi"]:
-    seconds_per_img = st.number_input("Ogni quanti secondi di audio creare un'immagine?",
-                                      min_value=1, value=int(st.session_state.get("seconds_per_img", 8)), step=1)
-    st.session_state["seconds_per_img"] = int(seconds_per_img)
-else:
-    sentences_per_image = st.number_input("Ogni quante frasi creare un'immagine?",
-                                          min_value=1, value=int(st.session_state.get("sentences_per_image", 2)), step=1)
-    st.session_state["sentences_per_image"] = int(sentences_per_image)
-
-# Prompt fisso per ogni immagine
-fixed_image_prompt = st.text_area(
-    "Prompt fisso per ogni immagine (opzionale)",
-    value=st.session_state.get("fixed_image_prompt", ""),
-    help="Esempio: 'Epoca dell'antica Roma nell'anno 200 d.C. Usa uno stile ultra realistico.'"
-)
-st.session_state["fixed_image_prompt"] = fixed_image_prompt
-
-fixed_prompt_position_label = radio_compat(
-    "Dove inserire il prompt fisso?",
-    options=["Dopo il testo del chunk", "Prima del testo del chunk"],
-    index=0 if st.session_state.get("fixed_image_prompt_position", "after") == "after" else 1,
-    horizontal_default=True
-)
-fixed_pos_norm = "after" if fixed_prompt_position_label.startswith("Dopo") else "before"
-st.session_state["fixed_image_prompt_position"] = fixed_pos_norm
-
-generate = st.button("🚀 Genera contenuti")
-
-# ===========================
-# 🚀 Avvio generazione
-# ===========================
-if generate and title.strip() and script.strip():
-    # cartelle output
-    safe = sanitize(title)
-    base = os.path.join("data", "outputs", safe)
-    img_dir = os.path.join(base, "images")
-    aud_dir = os.path.join(base, "audio")
-    os.makedirs(img_dir, exist_ok=True)
-    os.makedirs(aud_dir, exist_ok=True)
-
-    audio_path = os.path.join(aud_dir, "combined_audio.mp3")
-
-    st.subheader("🔄 Generazione in corso…")
-
-    # runtime cfg
-    runtime_cfg: Dict[str, Any] = dict(base_cfg)
-    replicate_from_ui = _clean_token(get_replicate_key())
-    fishaudio_from_ui = _clean_token(get_fishaudio_key())
-    if replicate_from_ui:
-        os.environ["REPLICATE_API_TOKEN"] = replicate_from_ui
-        runtime_cfg["replicate_api_key"] = replicate_from_ui
-        runtime_cfg["replicate_api_token"] = replicate_from_ui
-    if fishaudio_from_ui:
-        os.environ["FISHAUDIO_API_KEY"] = fishaudio_from_ui
-        runtime_cfg["fishaudio_api_key"] = fishaudio_from_ui
-
-    # risolvi modello Replicate
-    effective = get_replicate_model()
-    if effective:
-        resolved_model, err = resolve_replicate_model_identifier(effective, replicate_from_ui)
-        if resolved_model:
-            runtime_cfg["replicate_model"] = resolved_model
-            runtime_cfg["replicate_model_resolved"] = resolved_model
-            if ":" not in effective:
-                st.caption(f"🔁 Modello risolto automaticamente: `{resolved_model}`")
-        else:
-            runtime_cfg["replicate_model"] = effective
-            st.warning(f"⚠️ Modello non risolto: {err}")
-
-    # audio params
-    fish_voice = get_fishaudio_voice_id()
-    if fish_voice:
-        runtime_cfg["fishaudio_voice_id"] = fish_voice
-
-    st.write("🔐 Replicate token: "
-             + _mask(runtime_cfg.get("replicate_api_key") or runtime_cfg.get("replicate_api_token") or os.getenv("REPLICATE_API_TOKEN"))
-             + " · Modello: `" + (runtime_cfg.get("replicate_model") or runtime_cfg.get("image_model") or "—") + "`")
-
-    # ---- AUDIO (con resume) ----
-    if mode in ["Audio", "Entrambi"]:
-        if not fish_ok:
-            st.error("❌ FishAudio API key mancante.")
-            st.stop()
-        if not get_fishaudio_voice_id():
-            st.error("❌ FishAudio Voice ID mancante.")
-            st.stop()
-        st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
+    # Carica config opzionale
+    base_cfg: Dict[str, Any] = {}
+    if load_config:
         try:
-            final_audio = generate_audio_with_resume(script, runtime_cfg, aud_dir, max_chars=2000)
+            loaded = load_config()
+            if isinstance(loaded, dict):
+                base_cfg = loaded
         except Exception as e:
-            st.error("❌ Errore durante la generazione audio.")
-            st.exception(e)
-            st.stop()
-        if final_audio:
-            audio_path = final_audio
-            st.success("🎉 Audio pronto. Puoi scaricarlo subito mentre genero (eventualmente) le immagini.")
-            st.session_state["audio_path"] = audio_path
+            st.warning(f"Config opzionale non caricata: {e}")
+
+    # ===========================
+    # 🔐 & ⚙️ Sidebar: API + Parametri
+    # ===========================
+    with st.sidebar:
+        st.header("🔐 API Keys")
+        st.caption("Le chiavi valgono solo per *questa sessione* del browser.")
+
+        rep_prefill = st.session_state.get("replicate_api_key", "")
+        fish_prefill = st.session_state.get("fish_audio_api_key", "")
+
+        with st.form("api_keys_form", clear_on_submit=False):
+            replicate_key = st.text_input("Replicate API key", type="password", value=rep_prefill, placeholder="r8_********")
+            fish_key = st.text_input("FishAudio API key", type="password", value=fish_prefill, placeholder="fa_********")
+            save_keys = st.form_submit_button("💾 Save")
+
+        if save_keys:
+            st.session_state["replicate_api_key"] = replicate_key.strip()
+            st.session_state["fish_audio_api_key"] = fish_key.strip()
+            st.success("Chiavi salvate nella sessione!")
+
+        st.subheader("🔎 Verifica token Replicate")
+        if st.button("Verifica token"):
+            tok = _clean_token(st.session_state.get("replicate_api_key", ""))
+            if not tok:
+                st.error("Nessun token Replicate inserito.")
+            else:
+                try:
+                    r = requests.get("https://api.replicate.com/v1/account",
+                                     headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+                    if r.status_code == 200:
+                        who = r.json()
+                        st.success(f"✅ Token valido. Utente: {who.get('username','?')}")
+                    else:
+                        st.error(f"❌ Token NON valido. HTTP {r.status_code}: {r.text[:200]}")
+                except Exception as e:
+                    st.error(f"❌ Errore chiamando l’API: {e}")
+
+        st.divider()
+        st.header("⚙️ Parametri generazione")
+
+        # FishAudio Voice ID
+        voice_prefill = st.session_state.get("fishaudio_voice_id", "")
+        fish_voice_id = st.text_input("FishAudio Voice ID", value=voice_prefill, placeholder="es. voice_123abc...")
+        if fish_voice_id != voice_prefill:
+            st.session_state["fishaudio_voice_id"] = fish_voice_id.strip()
+
+        # Modello Replicate (preset + custom)
+        model_presets = [
+            "black-forest-labs/flux-schnell",
+            "black-forest-labs/flux-1.1",
+            "stability-ai/sdxl",
+            "scenario/anything-v4.5",
+            "Custom (digita sotto)",
+        ]
+        preset_selected = st.selectbox("Modello Replicate (image generator)", model_presets, index=0)
+
+        custom_prefill = st.session_state.get("replicate_model_custom", "")
+        custom_model = st.text_input("Custom model (owner/name:tag oppure owner/name)",
+                                     value=custom_prefill,
+                                     placeholder="es. black-forest-labs/flux-1.1")
+        if custom_model != custom_prefill:
+            st.session_state["replicate_model_custom"] = custom_model.strip()
+
+        effective_model = (st.session_state.get("replicate_model_custom", "").strip()
+                           if preset_selected == "Custom (digita sotto)" else preset_selected)
+        st.session_state["replicate_model"] = effective_model
+
+        if st.button("Verifica modello Replicate"):
+            tok = _clean_token(st.session_state.get("replicate_api_key", ""))
+            resolved, err = resolve_replicate_model_identifier(effective_model, tok)
+            if resolved: st.success(f"✅ Modello utilizzabile: `{resolved}`")
+            else: st.error(f"❌ Modello non utilizzabile: {err}")
+
+    # Funzioni per recuperare stati
+    def get_replicate_key() -> str:
+        return (st.session_state.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN", "")).strip()
+    def get_fishaudio_key() -> str:
+        return (st.session_state.get("fish_audio_api_key") or os.environ.get("FISHAUDIO_API_KEY", "")).strip()
+    def get_fishaudio_voice_id() -> str:
+        return (st.session_state.get("fishaudio_voice_id", "")).strip()
+    def get_replicate_model() -> str:
+        return (st.session_state.get("replicate_model", "")).strip()
+
+    # Badge di stato
+    rep_ok = bool(get_replicate_key())
+    fish_ok = bool(get_fishaudio_key())
+    rep_model = get_replicate_model() or "—"
+    voice_id = get_fishaudio_voice_id() or "—"
+    st.write(f"🔎 Stato API → Replicate: {'✅' if rep_ok else '⚠️'} · FishAudio: {'✅' if fish_ok else '⚠️'} · "
+             f"Model(Immagini): {rep_model} · VoiceID(Audio): {voice_id}")
+
+    # ===========================
+    # 🎛️ Parametri generazione (centrale)
+    # ===========================
+    title = st.text_input("Titolo del video")
+    script = st.text_area("Inserisci il testo da usare per generare immagini/audio", height=300)
+    mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
+
+    if mode in ["Audio", "Entrambi"]:
+        seconds_per_img = st.number_input("Ogni quanti secondi di audio creare un'immagine?",
+                                          min_value=1, value=int(st.session_state.get("seconds_per_img", 8)), step=1)
+        st.session_state["seconds_per_img"] = int(seconds_per_img)
+    else:
+        sentences_per_image = st.number_input("Ogni quante frasi creare un'immagine?",
+                                              min_value=1, value=int(st.session_state.get("sentences_per_image", 2)), step=1)
+        st.session_state["sentences_per_image"] = int(sentences_per_image)
+
+    # Prompt fisso per ogni immagine
+    fixed_image_prompt = st.text_area(
+        "Prompt fisso per ogni immagine (opzionale)",
+        value=st.session_state.get("fixed_image_prompt", ""),
+        help="Esempio: 'Epoca dell'antica Roma nell'anno 200 d.C. Usa uno stile ultra realistico.'"
+    )
+    st.session_state["fixed_image_prompt"] = fixed_image_prompt
+
+    fixed_prompt_position_label = radio_compat(
+        "Dove inserire il prompt fisso?",
+        options=["Dopo il testo del chunk", "Prima del testo del chunk"],
+        index=0 if st.session_state.get("fixed_image_prompt_position", "after") == "after" else 1,
+        horizontal_default=True
+    )
+    fixed_pos_norm = "after" if fixed_prompt_position_label.startswith("Dopo") else "before"
+    st.session_state["fixed_image_prompt_position"] = fixed_pos_norm
+
+    generate = st.button("🚀 Genera contenuti")
+
+    # ===========================
+    # 🚀 Avvio generazione
+    # ===========================
+    if generate and title.strip() and script.strip():
+        # cartelle output
+        safe = sanitize(title)
+        base = os.path.join("data", "outputs", safe)
+        img_dir = os.path.join(base, "images")
+        aud_dir = os.path.join(base, "audio")
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(aud_dir, exist_ok=True)
+
+        audio_path = os.path.join(aud_dir, "combined_audio.mp3")
+
+        st.subheader("🔄 Generazione in corso…")
+
+        # runtime cfg
+        runtime_cfg: Dict[str, Any] = dict(base_cfg)
+        replicate_from_ui = _clean_token(get_replicate_key())
+        fishaudio_from_ui = _clean_token(get_fishaudio_key())
+        if replicate_from_ui:
+            os.environ["REPLICATE_API_TOKEN"] = replicate_from_ui
+            runtime_cfg["replicate_api_key"] = replicate_from_ui
+            runtime_cfg["replicate_api_token"] = replicate_from_ui
+        if fishaudio_from_ui:
+            os.environ["FISHAUDIO_API_KEY"] = fishaudio_from_ui
+            runtime_cfg["fishaudio_api_key"] = fishaudio_from_ui
+
+        # risolvi modello Replicate
+        effective = get_replicate_model()
+        if effective:
+            resolved_model, err = resolve_replicate_model_identifier(effective, replicate_from_ui)
+            if resolved_model:
+                runtime_cfg["replicate_model"] = resolved_model
+                runtime_cfg["replicate_model_resolved"] = resolved_model
+                if ":" not in effective:
+                    st.caption(f"🔁 Modello risolto automaticamente: `{resolved_model}`")
+            else:
+                runtime_cfg["replicate_model"] = effective
+                st.warning(f"⚠️ Modello non risolto: {err}")
+
+        # audio params
+        fish_voice = get_fishaudio_voice_id()
+        if fish_voice:
+            runtime_cfg["fishaudio_voice_id"] = fish_voice
+
+        st.write("🔐 Replicate token: "
+                 + _mask(runtime_cfg.get("replicate_api_key") or runtime_cfg.get("replicate_api_token") or os.getenv("REPLICATE_API_TOKEN"))
+                 + " · Modello: `" + (runtime_cfg.get("replicate_model") or runtime_cfg.get("image_model") or "—") + "`")
+
+        # ---- AUDIO (con resume) ----
+        if mode in ["Audio", "Entrambi"]:
+            if not fish_ok:
+                st.error("❌ FishAudio API key mancante.")
+                st.stop()
+            if not get_fishaudio_voice_id():
+                st.error("❌ FishAudio Voice ID mancante.")
+                st.stop()
+            st.text(f"🎧 Generazione audio con voce: {get_fishaudio_voice_id()} …")
             try:
-                with open(audio_path, "rb") as f:
-                    st.download_button("🎧 Scarica Audio MP3 (subito)", f, file_name="audio.mp3",
-                                       mime="audio/mpeg", key="dl-audio-early")
-            except Exception:
-                pass
-        else:
-            st.error("⚠️ Audio non completato.")
-            st.stop()
+                final_audio = generate_audio_with_resume(script, runtime_cfg, aud_dir, max_chars=2000)
+            except Exception as e:
+                st.error("❌ Errore durante la generazione audio.")
+                st.exception(e)
+                st.stop()
+            if final_audio:
+                audio_path = final_audio
+                st.success("🎉 Audio pronto. Puoi scaricarlo subito mentre genero (eventualmente) le immagini.")
+                st.session_state["audio_path"] = audio_path
+                try:
+                    with open(audio_path, "rb") as f:
+                        st.download_button("🎧 Scarica Audio MP3 (subito)", f, file_name="audio.mp3",
+                                           mime="audio/mpeg", key="dl-audio-early")
+                except Exception:
+                    pass
+            else:
+                st.error("⚠️ Audio non completato.")
+                st.stop()
 
-    # ---- IMMAGINI (con resume + prompt fisso) ----
-    if mode in ["Immagini", "Entrambi"]:
-        if not rep_ok:
-            st.error("❌ Replicate API key mancante.")
-            st.stop()
-        if not runtime_cfg.get("replicate_model"):
-            st.error("❌ Modello Replicate mancante o non risolto.")
-            st.stop()
+        # ---- IMMAGINI (con resume + prompt fisso) ----
+        if mode in ["Immagini", "Entrambi"]:
+            if not rep_ok:
+                st.error("❌ Replicate API key mancante.")
+                st.stop()
+            if not runtime_cfg.get("replicate_model"):
+                st.error("❌ Modello Replicate mancante o non risolto.")
+                st.stop()
 
-        fixed = st.session_state.get("fixed_image_prompt", "") or ""
-        fixed_pos = st.session_state.get("fixed_image_prompt_position", "after")
+            fixed = st.session_state.get("fixed_image_prompt", "") or ""
+            fixed_pos = st.session_state.get("fixed_image_prompt_position", "after")
 
-        try:
-            if mode == "Entrambi":
-                if not os.path.exists(audio_path):
-                    st.error("❌ Audio non trovato per calcolare le immagini.")
+            try:
+                if mode == "Entrambi":
+                    if not os.path.exists(audio_path):
+                        st.error("❌ Audio non trovato per calcolare le immagini.")
+                    else:
+                        secs = int(st.session_state.get("seconds_per_img", 8))
+                        st.text(f"🖼️ Generazione immagini (1 ogni {secs}s)…")
+                        try:
+                            duration_sec = mp3_duration_seconds(audio_path) if mp3_duration_seconds else 0
+                        except Exception:
+                            duration_sec = 0
+                        if not duration_sec: duration_sec = 60
+                        num_images = max(1, int(duration_sec // max(1, secs)))
+                        approx_chars = max(1, len(script) // max(1, num_images))
+                        base_chunks = chunk_text(script, approx_chars) if chunk_text else [script]
+                        img_chunks = [combined_image_prompt(c, fixed, fixed_pos) for c in base_chunks]
+                        resume_key = {
+                            "script_hash": script_hash(script + "||" + fixed + "||" + fixed_pos),
+                            "strategy": "by_seconds",
+                            "param_value": secs,
+                            "fixed_prompt_hash": script_hash(fixed),
+                            "fixed_prompt_position": fixed_pos,
+                        }
+                        ok_imgs = generate_images_with_resume(img_chunks, img_dir, resume_key, runtime_cfg)
+                        if ok_imgs: zip_images(base)
                 else:
-                    secs = int(st.session_state.get("seconds_per_img", 8))
-                    st.text(f"🖼️ Generazione immagini (1 ogni {secs}s)…")
-                    try:
-                        duration_sec = mp3_duration_seconds(audio_path) if mp3_duration_seconds else 0
-                    except Exception:
-                        duration_sec = 0
-                    if not duration_sec: duration_sec = 60
-                    num_images = max(1, int(duration_sec // max(1, secs)))
-                    approx_chars = max(1, len(script) // max(1, num_images))
-                    base_chunks = chunk_text(script, approx_chars) if chunk_text else [script]
-                    img_chunks = [combined_image_prompt(c, fixed, fixed_pos) for c in base_chunks]
+                    spi = int(st.session_state.get("sentences_per_image", 2)) or 2
+                    st.text(f"🖼️ Generazione immagini (1 ogni {spi} frasi)…")
+                    base_groups = (chunk_by_sentences_count(script, spi) if chunk_by_sentences_count else [script])
+                    img_chunks = [combined_image_prompt(c, fixed, fixed_pos) for c in base_groups]
                     resume_key = {
                         "script_hash": script_hash(script + "||" + fixed + "||" + fixed_pos),
-                        "strategy": "by_seconds",
-                        "param_value": secs,
+                        "strategy": "by_sentences",
+                        "param_value": spi,
                         "fixed_prompt_hash": script_hash(fixed),
                         "fixed_prompt_position": fixed_pos,
                     }
                     ok_imgs = generate_images_with_resume(img_chunks, img_dir, resume_key, runtime_cfg)
                     if ok_imgs: zip_images(base)
-            else:
-                spi = int(st.session_state.get("sentences_per_image", 2)) or 2
-                st.text(f"🖼️ Generazione immagini (1 ogni {spi} frasi)…")
-                base_groups = (chunk_by_sentences_count(script, spi) if chunk_by_sentences_count else [script])
-                img_chunks = [combined_image_prompt(c, fixed, fixed_pos) for c in base_groups]
-                resume_key = {
-                    "script_hash": script_hash(script + "||" + fixed + "||" + fixed_pos),
-                    "strategy": "by_sentences",
-                    "param_value": spi,
-                    "fixed_prompt_hash": script_hash(fixed),
-                    "fixed_prompt_position": fixed_pos,
-                }
-                ok_imgs = generate_images_with_resume(img_chunks, img_dir, resume_key, runtime_cfg)
-                if ok_imgs: zip_images(base)
-        except Exception as e:
-            st.error("❌ Errore durante la generazione immagini.")
-            st.exception(e)
-            st.stop()
+            except Exception as e:
+                st.error("❌ Errore durante la generazione immagini.")
+                st.exception(e)
+                st.stop()
 
-    st.success("✅ Generazione completata!")
-    st.session_state["audio_path"] = audio_path if os.path.exists(audio_path) else st.session_state.get("audio_path")
-    zip_path = os.path.join(base, "output.zip")
-    st.session_state["zip_path"] = zip_path if os.path.exists(zip_path) else None
+        st.success("✅ Generazione completata!")
+        st.session_state["audio_path"] = audio_path if os.path.exists(audio_path) else st.session_state.get("audio_path")
+        zip_path = os.path.join(base, "output.zip")
+        st.session_state["zip_path"] = zip_path if os.path.exists(zip_path) else None
 
-# ---- Download (finale)
-if st.session_state.get("audio_path") and os.path.exists(st.session_state["audio_path"]):
+    # ---- Download (finale)
+    if st.session_state.get("audio_path") and os.path.exists(st.session_state["audio_path"]):
+        try:
+            with open(st.session_state["audio_path"], "rb") as f:
+                st.download_button("🎧 Scarica Audio MP3", f, file_name="audio.mp3", mime="audio/mpeg", key="dl-audio-final")
+        except Exception:
+            pass
+
+    if st.session_state.get("zip_path") and os.path.exists(st.session_state["zip_path"]):
+        try:
+            with open(st.session_state["zip_path"], "rb") as f:
+                st.download_button("🖼️ Scarica ZIP Immagini", f, file_name="output.zip", mime="application/zip", key="dl-zip")
+        except Exception:
+            pass
+
+# Avvio protetto: mostra lo stacktrace in pagina invece del generico "Oh no"
+if __name__ == "__main__":
     try:
-        with open(st.session_state["audio_path"], "rb") as f:
-            st.download_button("🎧 Scarica Audio MP3", f, file_name="audio.mp3", mime="audio/mpeg", key="dl-audio-final")
-    except Exception:
-        pass
-
-if st.session_state.get("zip_path") and os.path.exists(st.session_state["zip_path"]):
-    try:
-        with open(st.session_state["zip_path"], "rb") as f:
-            st.download_button("🖼️ Scarica ZIP Immagini", f, file_name="output.zip", mime="application/zip", key="dl-zip")
-    except Exception:
-        pass
+        main()
+    except Exception as e:
+        st.error("🚨 L'app è andata in errore all'avvio (import-time). Ecco lo stacktrace:")
+        st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))

@@ -2,8 +2,7 @@
 # -------------------------------------------------------
 # Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
 # Compatibile con Python 3.13: niente pydub; usiamo mutagen + ffmpeg via imageio-ffmpeg.
-# Con ripresa progressi AUDIO (resume): salva manifest + chunk MP3 numerati.
-# Concat robusta: fallback via WAV -> concat -> MP3 finale.
+# Resume AUDIO + validazione chunk + concat ultra-robusta con diagnosi.
 # -------------------------------------------------------
 
 import os
@@ -36,6 +35,8 @@ try:
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     FFMPEG_EXE = "ffmpeg"  # fallback: deve essere nel PATH
+
+FFPROBE_EXE = os.environ.get("FFPROBE_EXE", "ffprobe")  # usa ffprobe di sistema
 
 # ---------------------------
 # Utility di base
@@ -76,8 +77,7 @@ def script_hash(text: str) -> str:
 def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
     """
     Divide il testo in blocchi di circa max_chars caratteri,
-    spezzando dopo . ! ? dove possibile.
-    Se una singola frase supera max_chars, la spezza duramente.
+    spezzando dopo . ! ? dove possibile. Se una singola frase supera max_chars, la spezza duramente.
     """
     t = re.sub(r"\s+", " ", (text or "").strip())
     if not t:
@@ -114,7 +114,7 @@ def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
     return [c for c in chunks if c]
 
 # ---------------------------
-# Manifest + concat MP3
+# Manifest
 # ---------------------------
 def manifest_path(aud_dir: str) -> str:
     return os.path.join(aud_dir, "audio_manifest.json")
@@ -140,115 +140,79 @@ def save_manifest(aud_dir: str, data: dict) -> None:
 def chunk_filename(aud_dir: str, idx: int) -> str:
     return os.path.join(aud_dir, f"chunk_{idx:04d}.mp3")
 
-def _ffconcat_escape(path: str) -> str:
-    """Escapa backslash e apici singoli per il file di lista ffmpeg (-f concat)."""
-    return path.replace("\\", "\\\\").replace("'", "\\'")
-
-def _run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
+# ---------------------------
+# FFmpeg helpers
+# ---------------------------
+def _run(cmd: list[str]) -> tuple[bool, str]:
     try:
         p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return True, (p.stderr.decode("utf-8", "ignore") or p.stdout.decode("utf-8", "ignore"))
+        out = (p.stderr.decode("utf-8", "ignore") or p.stdout.decode("utf-8", "ignore"))
+        return True, out
     except subprocess.CalledProcessError as e:
-        return False, (e.stderr.decode("utf-8", "ignore") if e.stderr else str(e))
+        msg = (e.stderr.decode("utf-8", "ignore") if e.stderr else str(e))
+        return False, msg
 
-def _concat_try_copy(aud_dir: str, out_path: str, total_chunks: int) -> tuple[bool, str]:
-    list_file = os.path.join(aud_dir, "concat_list.txt")
-    with open(list_file, "w", encoding="utf-8") as f:
-        for i in range(total_chunks):
-            esc = _ffconcat_escape(chunk_filename(aud_dir, i))
-            f.write(f"file '{esc}'\n")
-    cmd = [FFMPEG_EXE, "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", out_path]
-    return _run_ffmpeg(cmd)
+def _ffconcat_escape(path: str) -> str:
+    """Escapa backslash e apici singoli per il file lista di ffmpeg (-f concat)."""
+    return path.replace("\\", "\\\\").replace("'", "\\'")
 
-def _concat_try_reencode_from_list(aud_dir: str, out_path: str) -> tuple[bool, str]:
-    """Usa lo stesso list file, ma forza ricodifica a MP3 (potrebbe comunque fallire se il demuxer non accetta stream eterogenei)."""
-    list_file = os.path.join(aud_dir, "concat_list.txt")
-    # proviamo libmp3lame, poi mp3
-    cmd1 = [FFMPEG_EXE, "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-vn", "-c:a", "libmp3lame", "-q:a", "2", out_path]
-    ok, log = _run_ffmpeg(cmd1)
-    if ok:
-        return ok, log
-    cmd2 = [FFMPEG_EXE, "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-vn", "-c:a", "mp3", "-q:a", "2", out_path]
-    return _run_ffmpeg(cmd2)
-
-def _concat_via_wav(aud_dir: str, out_path: str, total_chunks: int) -> tuple[bool, str]:
-    """
-    Fallback robusto:
-      1) Ricodifica ciascun chunk in WAV coerente (stereo, 44.1kHz, s16).
-      2) Concatena i WAV (copy) in combined.wav
-      3) Ricodifica il WAV finale in MP3 (libmp3lame o mp3)
-    """
-    tmp_dir = os.path.join(aud_dir, "_concat_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-
-    # 1) mp3 -> wav coerenti
-    wav_paths = []
-    for i in range(total_chunks):
-        src = chunk_filename(aud_dir, i)
-        if not os.path.exists(src):
-            return False, f"Chunk mancante: {src}"
-        dst = os.path.join(tmp_dir, f"chunk_{i:04d}.wav")
-        cmd = [FFMPEG_EXE, "-y", "-i", src, "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", dst]
-        ok, log = _run_ffmpeg(cmd)
-        if not ok:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            return False, f"WAV transcode fallita al chunk {i}: {log}"
-        wav_paths.append(dst)
-
-    # 2) concatena WAV (copy)
-    wav_list = os.path.join(tmp_dir, "wav_list.txt")
-    with open(wav_list, "w", encoding="utf-8") as f:
-        for p in wav_paths:
-            esc = _ffconcat_escape(p)
-            f.write(f"file '{esc}'\n")
-    combined_wav = os.path.join(tmp_dir, "combined.wav")
-    ok, log = _run_ffmpeg([FFMPEG_EXE, "-y", "-f", "concat", "-safe", "0", "-i", wav_list, "-c", "copy", combined_wav])
-    if not ok:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return False, f"Concat WAV fallita: {log}"
-
-    # 3) WAV -> MP3 finale
-    cmd1 = [FFMPEG_EXE, "-y", "-i", combined_wav, "-vn", "-c:a", "libmp3lame", "-q:a", "2", out_path]
-    ok, log = _run_ffmpeg(cmd1)
-    if not ok:
-        cmd2 = [FFMPEG_EXE, "-y", "-i", combined_wav, "-vn", "-c:a", "mp3", "-q:a", "2", out_path]
-        ok, log = _run_ffmpeg(cmd2)
-
-    # pulizia temp
+def ffprobe_has_audio(path: str) -> bool:
+    """True se il file ha almeno uno stream audio. Se ffprobe non esiste, fallback su size>0."""
+    if not os.path.exists(path) or os.path.getsize(path) <= 0:
+        return False
+    # prova ffprobe
     try:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        cmd = [
+            FFPROBE_EXE, "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type",
+            "-of", "default=nk=1:nw=1",
+            path
+        ]
+        ok, out = _run(cmd)
+        if not ok:
+            return False
+        # se c'è almeno una riga 'audio'
+        return any(line.strip() == "audio" for line in out.splitlines())
+    except Exception:
+        # se ffprobe non disponibile, consideriamo valido se size>0
+        return os.path.getsize(path) > 0
+
+def mp3_to_wav(src_mp3: str, dst_wav: str) -> tuple[bool, str]:
+    """Ricodifica in WAV coerente (stereo, 44.1kHz, s16)."""
+    cmd = [FFMPEG_EXE, "-y", "-i", src_mp3, "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", dst_wav]
+    return _run(cmd)
+
+def concat_wavs_demuxer(wav_paths: list[str], combined_wav: str) -> tuple[bool, str]:
+    """Concatena WAV via demuxer -f concat -c copy."""
+    tmp_list = combined_wav + ".list.txt"
+    with open(tmp_list, "w", encoding="utf-8") as f:
+        for p in wav_paths:
+            f.write(f"file '{_ffconcat_escape(p)}'\n")
+    cmd = [FFMPEG_EXE, "-y", "-f", "concat", "-safe", "0", "-i", tmp_list, "-c", "copy", combined_wav]
+    ok, log = _run(cmd)
+    try:
+        os.remove(tmp_list)
     except Exception:
         pass
-
     return ok, log
 
-def concat_mp3_chunks(aud_dir: str, out_path: str, total_chunks: int) -> bool:
-    """
-    Strategia:
-      A) concat demuxer + copy (veloce)
-      B) concat demuxer con ricodifica diretta a mp3
-      C) Fallback robusto: WAV coerenti -> concat -> MP3
-    """
-    if total_chunks <= 0:
-        return False
-
-    # Se esiste già un MP3 finale non vuoto, riusa
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return True
-
-    # A) veloce
-    ok, log = _concat_try_copy(aud_dir, out_path, total_chunks)
-    if ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return True
-
-    # B) ricodifica diretta (potrebbe comunque fallire)
-    ok, log_b = _concat_try_reencode_from_list(aud_dir, out_path)
-    if ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return True
-
-    # C) WAV robusto
-    ok, log_c = _concat_via_wav(aud_dir, out_path, total_chunks)
-    return ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0
+def concat_wavs_filter_complex_to_mp3(wav_paths: list[str], out_mp3: str) -> tuple[bool, str]:
+    """Concatena WAV usando filter_complex concat e produce MP3 finale."""
+    if not wav_paths:
+        return False, "No WAV inputs"
+    cmd = [FFMPEG_EXE, "-y"]
+    for p in wav_paths:
+        cmd += ["-i", p]
+    # concat audio-only
+    filter_str = f"concat=n={len(wav_paths)}:v=0:a=1"
+    # usa libmp3lame, fallback a 'mp3'
+    cmd_lame = cmd + ["-filter_complex", filter_str, "-vn", "-c:a", "libmp3lame", "-q:a", "2", out_mp3]
+    ok, log = _run(cmd_lame)
+    if ok:
+        return True, log
+    cmd_mp3 = cmd + ["-filter_complex", filter_str, "-vn", "-c:a", "mp3", "-q:a", "2", out_mp3]
+    return _run(cmd_mp3)
 
 # ---------------------------
 # Sintesi di UN chunk riusando scripts.utils.generate_audio
@@ -262,31 +226,125 @@ def synthesize_single_chunk(text_chunk: str, runtime_cfg: dict, aud_dir: str, id
     os.makedirs(tmp_out, exist_ok=True)
     try:
         result_path = generate_audio([text_chunk], runtime_cfg, tmp_out)
-        if not result_path or not os.path.exists(result_path):
+        if not result_path or not os.path.exists(result_path) or os.path.getsize(result_path) <= 0:
+            shutil.rmtree(tmp_out, ignore_errors=True)
             return None
         dest = chunk_filename(aud_dir, idx)
         os.replace(result_path, dest)  # atomic move
-        try:
-            shutil.rmtree(tmp_out, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(tmp_out, ignore_errors=True)
         return dest
     except Exception:
-        try:
-            shutil.rmtree(tmp_out, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(tmp_out, ignore_errors=True)
         return None
 
 # ---------------------------
-# Generazione AUDIO con resume
+# Concat MP3 (robusta, diagnostica)
+# ---------------------------
+def concat_mp3_chunks_robust(script_chunks: list[str], runtime_cfg: dict, aud_dir: str) -> tuple[bool, str]:
+    """
+    1) Convalida ogni chunk mp3 con ffprobe.
+    2) Ricodifica tutti i chunk validi in WAV coerenti. Se un chunk fallisce, lo rigenera 1 volta.
+    3) Concat demuxer WAV -> combined.wav (copy). Se fallisce, usa filter_complex -> MP3 diretto.
+    4) Se tutto ok, encoda MP3 finale (se non prodotto dal passo 3).
+    Ritorna (ok, path_mp3) oppure (False, errore).
+    """
+    total_chunks = len(script_chunks)
+    if total_chunks == 0:
+        return False, "Nessun chunk"
+
+    # 1) validazione + autocorrezione base (file esiste + stream audio)
+    invalid = []
+    for i in range(total_chunks):
+        f = chunk_filename(aud_dir, i)
+        if not ffprobe_has_audio(f):
+            invalid.append(i)
+
+    # Rigenera una volta gli invalidi
+    if invalid:
+        st.warning(f"🔁 Rilevati {len(invalid)} chunk MP3 non validi: {invalid[:10]}{'…' if len(invalid)>10 else ''}. Rigenero…")
+        for i in invalid:
+            # elimina eventuale file corrotto
+            try:
+                os.remove(chunk_filename(aud_dir, i))
+            except Exception:
+                pass
+            # rigenera
+            out = synthesize_single_chunk(script_chunks[i], runtime_cfg, aud_dir, i)
+            if not (out and ffprobe_has_audio(out)):
+                return False, f"Chunk {i} non rigenerabile (MP3 invalido dopo rigenerazione)."
+
+    # 2) normalizza in WAV
+    tmp_dir = os.path.join(aud_dir, "_wav_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    wav_paths = []
+    bad_after_wav = []
+    for i in range(total_chunks):
+        src = chunk_filename(aud_dir, i)
+        wav = os.path.join(tmp_dir, f"chunk_{i:04d}.wav")
+        ok, log = mp3_to_wav(src, wav)
+        if not ok or (not os.path.exists(wav)) or os.path.getsize(wav) <= 0:
+            # ritenta una sola volta: rigenera MP3 e poi riconverte
+            out = synthesize_single_chunk(script_chunks[i], runtime_cfg, aud_dir, i)
+            if not (out and ffprobe_has_audio(out)):
+                bad_after_wav.append((i, "rigenerazione MP3 fallita"))
+                continue
+            ok2, log2 = mp3_to_wav(out, wav)
+            if not ok2 or (not os.path.exists(wav)) or os.path.getsize(wav) <= 0:
+                bad_after_wav.append((i, "transcode WAV fallita dopo rigenerazione"))
+                continue
+        wav_paths.append(wav)
+
+    if bad_after_wav:
+        # salva log diagnostico
+        log_path = os.path.join(aud_dir, "_concat_error.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("Chunk problematici (fase WAV):\n")
+            for idx, why in bad_after_wav:
+                f.write(f"- chunk {idx}: {why}\n")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False, f"Alcuni chunk non sono convertibili in WAV: {bad_after_wav}. Vedi log {log_path}"
+
+    # 3) concatena i WAV
+    combined_wav = os.path.join(tmp_dir, "combined.wav")
+    ok, log = concat_wavs_demuxer(wav_paths, combined_wav)
+    out_mp3 = os.path.join(aud_dir, "combined_audio.mp3")
+
+    if ok and os.path.exists(combined_wav) and os.path.getsize(combined_wav) > 0:
+        # encode MP3 dal WAV
+        ok2, log2 = _run([FFMPEG_EXE, "-y", "-i", combined_wav, "-vn", "-c:a", "libmp3lame", "-q:a", "2", out_mp3])
+        if not ok2:
+            ok3, log3 = _run([FFMPEG_EXE, "-y", "-i", combined_wav, "-vn", "-c:a", "mp3", "-q:a", "2", out_mp3])
+            if not ok3:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return False, f"Encoding MP3 dal WAV fallita: {log2}\n{log3}"
+    else:
+        # usa filter_complex per concatenare direttamente a MP3
+        ok_fc, log_fc = concat_wavs_filter_complex_to_mp3(wav_paths, out_mp3)
+        if not ok_fc:
+            log_path = os.path.join(aud_dir, "_concat_error.log")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("Concat fallita.\n")
+                f.write("Demuxer log:\n")
+                f.write((log or "") + "\n")
+                f.write("Filter_complex log:\n")
+                f.write((log_fc or "") + "\n")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return False, f"Concat fallita (demuxer e filter_complex). Log in {log_path}"
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 0:
+        return True, out_mp3
+    return False, "MP3 finale assente o vuoto dopo concat"
+
+# ---------------------------
+# Generazione AUDIO con resume + validazione
 # ---------------------------
 def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str, max_chars: int = 2000) -> str | None:
     """
     1) Crea i chunk del testo (~2000 char).
-    2) Salva/legge un manifest per il resume.
-    3) Genera ogni chunk come MP3 separato (chunk_0000.mp3, ...).
-    4) Concatena tutto in combined_audio.mp3 (con fallback robusto).
+    2) Manifest per resume (completed = solo chunk con stream audio valido).
+    3) Genera i mancanti.
+    4) Concat ultra-robusta con rigenerazione automatica dei chunk difettosi.
     """
     os.makedirs(aud_dir, exist_ok=True)
     chunks = split_text_into_sentence_chunks(script_text, max_chars=max_chars)
@@ -297,7 +355,7 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str
     m = load_manifest(aud_dir) or {}
     cur_hash = script_hash(script_text)
     expected = {
-        "version": 2,  # bump versione manifest per distinguere vecchi tentativi
+        "version": 3,  # bump
         "script_hash": cur_hash,
         "max_chars": max_chars,
         "total_chunks": total,
@@ -312,14 +370,15 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str
         m = expected
         save_manifest(aud_dir, m)
     else:
+        # normalizza
         m["completed"] = sorted(set(int(i) for i in m.get("completed", []) if 0 <= int(i) < total))
         save_manifest(aud_dir, m)
 
-    completed = set(m.get("completed", []))
-    # marca come completati i chunk mp3 già presenti
+    # Ricalcola 'completed' guardando file e stream audio reale
+    completed = set()
     for i in range(total):
         f = chunk_filename(aud_dir, i)
-        if os.path.exists(f) and os.path.getsize(f) > 0:
+        if ffprobe_has_audio(f):
             completed.add(i)
     m["completed"] = sorted(completed)
     save_manifest(aud_dir, m)
@@ -328,37 +387,37 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str
     prog = st.progress(len(completed) / total if total else 0.0)
     status = st.empty()
 
-    # genera solo i mancanti
+    # Genera i soli mancanti
     for i, piece in enumerate(chunks):
         if i in completed:
-            status.write(f"✅ Chunk {i+1}/{total} già presente, salto.")
+            status.write(f"✅ Chunk {i+1}/{total} ok, salto.")
             prog.progress((len(completed)) / total)
             continue
 
         status.write(f"🎙️ Genero chunk {i+1}/{total} …")
         out = synthesize_single_chunk(piece, runtime_cfg, aud_dir, i)
-        if out and os.path.exists(out):
+        if out and ffprobe_has_audio(out):
             completed.add(i)
             m["completed"] = sorted(completed)
             save_manifest(aud_dir, m)
             prog.progress(len(completed) / total)
         else:
-            st.error(f"❌ Errore nella generazione del chunk {i+1}. Puoi ripremere 'Genera contenuti' per riprendere.")
+            # lascia lo stato sul disco per resume
+            status.write(f"❌ Chunk {i+1} non valido. Ripremi 'Genera contenuti' per riprovare.")
             return None
 
-    status.write("🔗 Concateno i chunk MP3 in un unico file…")
-    final_path = os.path.join(aud_dir, "combined_audio.mp3")
-    ok = concat_mp3_chunks(aud_dir, final_path, total_chunks=total)
+    status.write("🔗 Concateno i chunk MP3…")
+    ok, result = concat_mp3_chunks_robust(chunks, runtime_cfg, aud_dir)
     if not ok:
-        st.error("❌ Concatenazione fallita anche con fallback WAV. I chunk singoli sono comunque salvati.")
+        st.error(f"❌ {result}")
         return None
 
+    final_path = result
     try:
         dur = mp3_duration_seconds(final_path)
         st.caption(f"⏱️ Durata audio: ~{int(dur)}s")
     except Exception:
         pass
-
     status.write("✅ Audio completo!")
     return final_path
 
@@ -574,7 +633,7 @@ if generate and title.strip() and script.strip():
         + "`"
     )
 
-    # ---- AUDIO (con resume) ----
+    # ---- AUDIO (con resume + validazione) ----
     if mode in ["Audio", "Entrambi"]:
         if not fish_ok:
             st.error("❌ FishAudio API key mancante. Inseriscila nella sidebar.")
@@ -586,7 +645,7 @@ if generate and title.strip() and script.strip():
             if final_audio:
                 audio_path = final_audio
             else:
-                st.error("⚠️ Audio non completato: premi di nuovo 'Genera contenuti' per riprovare la sola concatenazione.")
+                st.error("⚠️ Audio non completato. Premi di nuovo 'Genera contenuti' per rigenerare eventuali chunk rotti e riprovare la concat.")
                 st.stop()
 
     # ---- IMMAGINI ----

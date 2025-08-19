@@ -5,7 +5,8 @@
 # - Concat MP3 robusta (WAV fallback) + validazione chunk
 # - Risoluzione automatica modello Replicate -> owner/name:version_id
 # - Download audio immediato appena pronto
-# - UI: scelta "Ogni quanti secondi" per immagini (ripristinata)
+# - UI: scelta "Ogni quanti secondi" per immagini
+# - NEW: Resume IMMAGINI con manifest + img_XXXX.ext (non rigenera le già fatte)
 # -------------------------------------------------------
 
 import os
@@ -29,7 +30,7 @@ from scripts.utils import (
     chunk_text,
     chunk_by_sentences_count,
     generate_audio,        # riusato per generare un singolo chunk alla volta
-    generate_images,
+    generate_images,       # riusato per generare una singola immagine alla volta (in tmp)
     mp3_duration_seconds,  # util per leggere durata MP3
 )
 
@@ -119,29 +120,33 @@ def split_text_into_sentence_chunks(text: str, max_chars: int = 2000) -> List[st
     return [c for c in chunks if c]
 
 # ---------------------------
-# Manifest
+# Manifest path helpers
 # ---------------------------
-def manifest_path(aud_dir: str) -> str:
+def manifest_path_audio(aud_dir: str) -> str:
     return os.path.join(aud_dir, "audio_manifest.json")
 
-def load_manifest(aud_dir: str) -> Optional[Dict[str, Any]]:
-    p = manifest_path(aud_dir)
-    if os.path.exists(p):
+def manifest_path_images(img_dir: str) -> str:
+    return os.path.join(img_dir, "images_manifest.json")
+
+def load_manifest(path: str) -> Optional[Dict[str, Any]]:
+    if os.path.exists(path):
         try:
-            with open(p, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return None
     return None
 
-def save_manifest(aud_dir: str, data: Dict[str, Any]) -> None:
-    p = manifest_path(aud_dir)
-    tmp = p + ".tmp"
-    os.makedirs(aud_dir, exist_ok=True)
+def save_manifest(path: str, data: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, p)
+    os.replace(tmp, path)
 
+# ---------------------------
+# AUDIO: file helpers
+# ---------------------------
 def chunk_filename(aud_dir: str, idx: int) -> str:
     return os.path.join(aud_dir, f"chunk_{idx:04d}.mp3")
 
@@ -167,7 +172,7 @@ def ffprobe_has_audio(path: str) -> bool:
         return False
     try:
         cmd = [
-            os.environ.get("FFPROBE_EXE", FFPROBE_EXE), "-v", "error",
+            FFPROBE_EXE, "-v", "error",
             "-select_streams", "a:0",
             "-show_entries", "stream=codec_type",
             "-of", "default=nk=1:nw=1",
@@ -215,13 +220,9 @@ def concat_wavs_filter_complex_to_mp3(wav_paths: List[str], out_mp3: str) -> Tup
     return _run(cmd_mp3)
 
 # ---------------------------
-# Sintesi di UN chunk riusando scripts.utils.generate_audio
+# AUDIO: sintesi chunk singolo (riusa utils.generate_audio)
 # ---------------------------
 def synthesize_single_chunk(text_chunk: str, runtime_cfg: Dict[str, Any], aud_dir: str, idx: int) -> Optional[str]:
-    """
-    Genera un singolo chunk audio riusando generate_audio su una cartella temporanea,
-    poi rinomina il risultato a chunk_{idx:04d}.mp3 nell'aud_dir.
-    """
     tmp_out = os.path.join(aud_dir, f"_tmp_chunk_{idx:04d}")
     os.makedirs(tmp_out, exist_ok=True)
     try:
@@ -238,20 +239,14 @@ def synthesize_single_chunk(text_chunk: str, runtime_cfg: Dict[str, Any], aud_di
         return None
 
 # ---------------------------
-# Concat MP3 (robusta, diagnostica)
+# AUDIO: concat robusta + diagnosi
 # ---------------------------
 def concat_mp3_chunks_robust(script_chunks: List[str], runtime_cfg: Dict[str, Any], aud_dir: str) -> Tuple[bool, str]:
-    """
-    1) Convalida ogni chunk mp3 con ffprobe.
-    2) Ricodifica tutti i chunk validi in WAV coerenti (rigenera una volta i chunk difettosi).
-    3) Concat demuxer WAV -> combined.wav (copy), oppure filter_complex -> MP3 diretto.
-    Ritorna (ok, path_mp3) oppure (False, errore).
-    """
     total_chunks = len(script_chunks)
     if total_chunks == 0:
         return False, "Nessun chunk"
 
-    # 1) validazione + autocorrezione base
+    # 1) validazione e rigenerazione base
     invalid = []
     for i in range(total_chunks):
         f = chunk_filename(aud_dir, i)
@@ -269,7 +264,7 @@ def concat_mp3_chunks_robust(script_chunks: List[str], runtime_cfg: Dict[str, An
             if not (out and ffprobe_has_audio(out)):
                 return False, f"Chunk {i} non rigenerabile (MP3 invalido dopo rigenerazione)."
 
-    # 2) normalizza in WAV
+    # 2) normalizza WAV
     tmp_dir = os.path.join(aud_dir, "_wav_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     wav_paths: List[str] = []
@@ -298,7 +293,7 @@ def concat_mp3_chunks_robust(script_chunks: List[str], runtime_cfg: Dict[str, An
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False, f"Alcuni chunk non sono convertibili in WAV: {bad_after_wav}. Vedi log {log_path}"
 
-    # 3) concatena i WAV
+    # 3) concat
     combined_wav = os.path.join(tmp_dir, "combined.wav")
     ok, log = concat_wavs_demuxer(wav_paths, combined_wav)
     out_mp3 = os.path.join(aud_dir, "combined_audio.mp3")
@@ -329,41 +324,32 @@ def concat_mp3_chunks_robust(script_chunks: List[str], runtime_cfg: Dict[str, An
     return False, "MP3 finale assente o vuoto dopo concat"
 
 # ---------------------------
-# Generazione AUDIO con resume + validazione
+# AUDIO: generate con resume
 # ---------------------------
 def generate_audio_with_resume(script_text: str, runtime_cfg: Dict[str, Any], aud_dir: str, max_chars: int = 2000) -> Optional[str]:
-    """
-    1) Crea i chunk del testo (~2000 char).
-    2) Manifest per resume (completed = solo chunk con stream audio valido).
-    3) Genera i mancanti.
-    4) Concat ultra-robusta con rigenerazione automatica dei chunk difettosi.
-    """
     os.makedirs(aud_dir, exist_ok=True)
     chunks = split_text_into_sentence_chunks(script_text, max_chars=max_chars)
     total = len(chunks)
     if total == 0:
         return None
 
-    m = load_manifest(aud_dir) or {}
+    m_path = manifest_path_audio(aud_dir)
+    m = load_manifest(m_path) or {}
     cur_hash = script_hash(script_text)
     expected = {
-        "version": 3,  # bump
+        "version": 3,
         "script_hash": cur_hash,
         "max_chars": max_chars,
         "total_chunks": total,
         "completed": [],
     }
 
-    if not m or (
-        m.get("script_hash") != cur_hash or
-        int(m.get("max_chars", -1)) != max_chars or
-        int(m.get("total_chunks", -1)) != total
-    ):
+    if not m or (m.get("script_hash") != cur_hash or int(m.get("max_chars", -1)) != max_chars or int(m.get("total_chunks", -1)) != total):
         m = expected
-        save_manifest(aud_dir, m)
+        save_manifest(m_path, m)
     else:
         m["completed"] = sorted(set(int(i) for i in m.get("completed", []) if 0 <= int(i) < total))
-        save_manifest(aud_dir, m)
+        save_manifest(m_path, m)
 
     completed = set()
     for i in range(total):
@@ -371,7 +357,7 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: Dict[str, Any], au
         if ffprobe_has_audio(f):
             completed.add(i)
     m["completed"] = sorted(completed)
-    save_manifest(aud_dir, m)
+    save_manifest(m_path, m)
 
     st.caption(f"🎧 Audio: {total} chunk da generare (~{max_chars} caratteri ciascuno).")
     prog = st.progress(len(completed) / total if total else 0.0)
@@ -388,7 +374,7 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: Dict[str, Any], au
         if out and ffprobe_has_audio(out):
             completed.add(i)
             m["completed"] = sorted(completed)
-            save_manifest(aud_dir, m)
+            save_manifest(m_path, m)
             prog.progress(len(completed) / total)
         else:
             status.write(f"❌ Chunk {i+1} non valido. Ripremi 'Genera contenuti' per riprovare.")
@@ -410,6 +396,132 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: Dict[str, Any], au
     return final_path
 
 # ---------------------------
+# IMMAGINI: helpers + resume
+# ---------------------------
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+def _find_first_image_file(root: str) -> Optional[str]:
+    """Ritorna il primo file immagine trovato (ricorsivo), preferendo il più recente."""
+    candidates: List[Tuple[float, str]] = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if os.path.splitext(fn)[1].lower() in IMG_EXTS:
+                full = os.path.join(dirpath, fn)
+                try:
+                    mtime = os.path.getmtime(full)
+                except Exception:
+                    mtime = 0.0
+                candidates.append((mtime, full))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+def _image_existing_path(img_dir: str, idx: int) -> Optional[str]:
+    """Trova img_{idx:04d}.<ext> se esiste già."""
+    for ext in IMG_EXTS:
+        p = os.path.join(img_dir, f"img_{idx:04d}{ext}")
+        if os.path.exists(p) and os.path.getsize(p) > 0:
+            return p
+    return None
+
+def synthesize_single_image(text_chunk: str, runtime_cfg: Dict[str, Any], img_dir: str, idx: int) -> Optional[str]:
+    """
+    Genera UNA immagine per il chunk dato, usando generate_images([chunk]) in una cartella temporanea,
+    poi sposta/rinomina a img_{idx:04d}.ext in img_dir.
+    """
+    tmp_out = os.path.join(img_dir, f"_tmp_img_{idx:04d}")
+    os.makedirs(tmp_out, exist_ok=True)
+    try:
+        # generiamo esattamente 1 immagine passando lista con un solo chunk
+        generate_images([text_chunk], runtime_cfg, tmp_out)
+        produced = _find_first_image_file(tmp_out)
+        if not produced:
+            shutil.rmtree(tmp_out, ignore_errors=True)
+            return None
+        ext = os.path.splitext(produced)[1].lower()
+        if ext not in IMG_EXTS:
+            ext = ".png"  # fallback
+        dest = os.path.join(img_dir, f"img_{idx:04d}{ext}")
+        # se esiste già qualcosa per quell'indice, sovrascrivi in modo atomico
+        os.replace(produced, dest)
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return dest
+    except Exception:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        return None
+
+def generate_images_with_resume(img_chunks: List[str], img_dir: str, resume_key: Dict[str, Any], runtime_cfg: Dict[str, Any]) -> bool:
+    """
+    Resume per IMMAGINI.
+    - img_chunks: lista dei testi per ogni immagine da generare (ordine stabile).
+    - resume_key: {script_hash, strategy, param_value, total_images}
+      strategy in {"by_seconds", "by_sentences"} per distinguere layout diversi.
+    """
+    os.makedirs(img_dir, exist_ok=True)
+    total = len(img_chunks)
+    if total == 0:
+        return True
+
+    m_path = manifest_path_images(img_dir)
+    m = load_manifest(m_path) or {}
+
+    expected = {
+        "version": 1,
+        "script_hash": resume_key.get("script_hash"),
+        "strategy": resume_key.get("strategy"),
+        "param_value": int(resume_key.get("param_value", 0)),
+        "total_images": total,
+        "completed": [],
+    }
+
+    # reset se mismatch (nuovo testo / diversa strategia / diverso N immagini)
+    if (not m or
+        m.get("script_hash") != expected["script_hash"] or
+        m.get("strategy") != expected["strategy"] or
+        int(m.get("param_value", -1)) != expected["param_value"] or
+        int(m.get("total_images", -1)) != total):
+        m = expected
+        save_manifest(m_path, m)
+    else:
+        m["completed"] = sorted(set(int(i) for i in m.get("completed", []) if 0 <= int(i) < total))
+        save_manifest(m_path, m)
+
+    # marca come completati gli indici già presenti sul disco
+    completed = set(m.get("completed", []))
+    for i in range(total):
+        if _image_existing_path(img_dir, i):
+            completed.add(i)
+    m["completed"] = sorted(completed)
+    save_manifest(m_path, m)
+
+    st.caption(f"🖼️ Immagini: {total} da generare (resume attivo).")
+    prog = st.progress(len(completed) / total if total else 0.0)
+    status = st.empty()
+
+    # genera solo mancanti
+    for i, piece in enumerate(img_chunks):
+        if i in completed:
+            status.write(f"✅ Immagine {i+1}/{total} già presente, salto.")
+            prog.progress(len(completed) / total)
+            continue
+
+        status.write(f"🎨 Genero immagine {i+1}/{total} …")
+        out = synthesize_single_image(piece, runtime_cfg, img_dir, i)
+        if out and os.path.exists(out) and os.path.getsize(out) > 0:
+            completed.add(i)
+            m["completed"] = sorted(completed)
+            save_manifest(m_path, m)
+            prog.progress(len(completed) / total)
+        else:
+            st.error(f"❌ Errore immagine {i+1}. Puoi ripremere 'Genera contenuti' per riprendere dai mancanti.")
+            # non abortiamo del tutto: salviamo stato e fermiamo qui
+            return False
+
+    status.write("✅ Immagini completate!")
+    return True
+
+# ---------------------------
 # Risoluzione modello Replicate -> owner/name:version_id
 # ---------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -418,9 +530,7 @@ def resolve_replicate_model_identifier(model_input: str, token: str) -> Tuple[Op
     Accetta:
       - "owner/name"
       - "owner/name:version_or_tag"
-    Se manca la parte dopo ":", interroga l'API Replicate per ottenere default_version (o latest_version). Ritorna:
-      ( "owner/name:version_id", None )  in caso di successo
-      ( None, "messaggio di errore" )    in caso di errore
+    Se manca la parte dopo ":", interroga l'API Replicate per ottenere default_version (o latest_version).
     """
     mi = (model_input or "").strip()
     if not mi:
@@ -609,7 +719,7 @@ title = st.text_input("Titolo del video")
 script = st.text_area("Inserisci il testo da usare per generare immagini/audio", height=300)
 mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"])
 
-# ⚙️ UI ripristinata: seconds_per_img (visibile per Audio/Entrambi) o sentences_per_image
+# ⚙️ UI: seconds_per_img o sentences_per_image
 if mode in ["Audio", "Entrambi"]:
     seconds_per_img = st.number_input(
         "Ogni quanti secondi di audio creare un'immagine?",
@@ -710,7 +820,7 @@ if generate and title.strip() and script.strip():
                 st.error("⚠️ Audio non completato. Premi di nuovo 'Genera contenuti' per rigenerare eventuali chunk rotti e riprovare la concat.")
                 st.stop()
 
-    # ---- IMMAGINI ----
+    # ---- IMMAGINI (con resume) ----
     if mode in ["Immagini", "Entrambi"]:
         if not rep_ok:
             st.error("❌ Replicate API key mancante. Inseriscila nella sidebar.")
@@ -721,7 +831,7 @@ if generate and title.strip() and script.strip():
                 if not os.path.exists(audio_path):
                     st.error("❌ Audio non trovato per calcolare le immagini. Genera prima l’audio.")
                 else:
-                    secs = int(st.session_state.get("seconds_per_img", 8))  # usa valore scelto in UI
+                    secs = int(st.session_state.get("seconds_per_img", 8))
                     st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (1 ogni {secs}s di audio)…")
                     try:
                         duration_sec = mp3_duration_seconds(audio_path)
@@ -732,22 +842,28 @@ if generate and title.strip() and script.strip():
                     num_images = max(1, int(duration_sec // max(1, secs)))
                     approx_chars = max(1, len(script) // max(1, num_images))
                     img_chunks = chunk_text(script, approx_chars)
-                    st.text(f"🖼️ Generazione di {len(img_chunks)} immagini…")
-                    try:
-                        generate_images(img_chunks, runtime_cfg, img_dir)
+
+                    resume_key = {
+                        "script_hash": script_hash(script),
+                        "strategy": "by_seconds",
+                        "param_value": secs,
+                    }
+                    ok_imgs = generate_images_with_resume(img_chunks, img_dir, resume_key, runtime_cfg)
+                    if ok_imgs:
                         zip_images(base)
-                    except Exception as e:
-                        st.error(f"❌ Errore generazione immagini: {e}")
             else:
                 spi = int(st.session_state.get("sentences_per_image", 2)) or 2
                 st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (1 ogni {spi} frasi)…")
                 groups = chunk_by_sentences_count(script, spi)
-                st.text(f"🖼️ Generazione di {len(groups)} immagini…")
-                try:
-                    generate_images(groups, runtime_cfg, img_dir)
+
+                resume_key = {
+                    "script_hash": script_hash(script),
+                    "strategy": "by_sentences",
+                    "param_value": spi,
+                }
+                ok_imgs = generate_images_with_resume(groups, img_dir, resume_key, runtime_cfg)
+                if ok_imgs:
                     zip_images(base)
-                except Exception as e:
-                    st.error(f"❌ Errore generazione immagini: {e}")
 
     st.success("✅ Generazione completata!")
 

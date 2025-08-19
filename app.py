@@ -1,8 +1,11 @@
 # app.py
 # -------------------------------------------------------
-# Streamlit app: API e parametri (modello/voce), genera IMMAGINI / AUDIO.
-# Compatibile con Python 3.13: niente pydub; usiamo mutagen + ffmpeg via imageio-ffmpeg.
-# Resume AUDIO + validazione chunk + concat ultra-robusta con diagnosi.
+# Generatore di Video con Immagini e Audio (Streamlit)
+# - Resume AUDIO con manifest + chunk numerati
+# - Concat MP3 robusta (WAV fallback) + validazione chunk
+# - Risoluzione automatica modello Replicate -> owner/name:version_id
+# - Download audio immediato appena pronto
+# Compatibile con Python >=3.10
 # -------------------------------------------------------
 
 import os
@@ -14,6 +17,7 @@ import textwrap
 import subprocess
 import requests
 import streamlit as st
+from typing import Optional, Tuple, Dict, Any, List
 
 # se hai questo loader lo usiamo, altrimenti proseguiamo senza
 try:
@@ -24,9 +28,9 @@ except Exception:
 from scripts.utils import (
     chunk_text,
     chunk_by_sentences_count,
-    generate_audio,       # riusato per generare un singolo chunk alla volta
+    generate_audio,        # riusato per generare un singolo chunk alla volta
     generate_images,
-    mp3_duration_seconds, # util per leggere durata MP3
+    mp3_duration_seconds,  # util per leggere durata MP3
 )
 
 # imageio-ffmpeg per trovare ffmpeg
@@ -74,7 +78,7 @@ def script_hash(text: str) -> str:
 # ---------------------------
 # Split testo per AUDIO a ~2000 caratteri spezzando sui punti
 # ---------------------------
-def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
+def split_text_into_sentence_chunks(text: str, max_chars: int = 2000) -> List[str]:
     """
     Divide il testo in blocchi di circa max_chars caratteri,
     spezzando dopo . ! ? dove possibile. Se una singola frase supera max_chars, la spezza duramente.
@@ -84,7 +88,8 @@ def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
         return []
 
     sentences = re.split(r"(?<=[\.\!\?])\s+", t)
-    chunks, acc = [], ""
+    chunks: List[str] = []
+    acc = ""
 
     def flush_acc():
         nonlocal acc
@@ -119,7 +124,7 @@ def split_text_into_sentence_chunks(text: str, max_chars: int = 2000):
 def manifest_path(aud_dir: str) -> str:
     return os.path.join(aud_dir, "audio_manifest.json")
 
-def load_manifest(aud_dir: str) -> dict | None:
+def load_manifest(aud_dir: str) -> Optional[Dict[str, Any]]:
     p = manifest_path(aud_dir)
     if os.path.exists(p):
         try:
@@ -129,7 +134,7 @@ def load_manifest(aud_dir: str) -> dict | None:
             return None
     return None
 
-def save_manifest(aud_dir: str, data: dict) -> None:
+def save_manifest(aud_dir: str, data: Dict[str, Any]) -> None:
     p = manifest_path(aud_dir)
     tmp = p + ".tmp"
     os.makedirs(aud_dir, exist_ok=True)
@@ -143,7 +148,7 @@ def chunk_filename(aud_dir: str, idx: int) -> str:
 # ---------------------------
 # FFmpeg helpers
 # ---------------------------
-def _run(cmd: list[str]) -> tuple[bool, str]:
+def _run(cmd: List[str]) -> Tuple[bool, str]:
     try:
         p = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out = (p.stderr.decode("utf-8", "ignore") or p.stdout.decode("utf-8", "ignore"))
@@ -172,18 +177,16 @@ def ffprobe_has_audio(path: str) -> bool:
         ok, out = _run(cmd)
         if not ok:
             return False
-        # se c'è almeno una riga 'audio'
         return any(line.strip() == "audio" for line in out.splitlines())
     except Exception:
-        # se ffprobe non disponibile, consideriamo valido se size>0
         return os.path.getsize(path) > 0
 
-def mp3_to_wav(src_mp3: str, dst_wav: str) -> tuple[bool, str]:
+def mp3_to_wav(src_mp3: str, dst_wav: str) -> Tuple[bool, str]:
     """Ricodifica in WAV coerente (stereo, 44.1kHz, s16)."""
     cmd = [FFMPEG_EXE, "-y", "-i", src_mp3, "-vn", "-ac", "2", "-ar", "44100", "-sample_fmt", "s16", dst_wav]
     return _run(cmd)
 
-def concat_wavs_demuxer(wav_paths: list[str], combined_wav: str) -> tuple[bool, str]:
+def concat_wavs_demuxer(wav_paths: List[str], combined_wav: str) -> Tuple[bool, str]:
     """Concatena WAV via demuxer -f concat -c copy."""
     tmp_list = combined_wav + ".list.txt"
     with open(tmp_list, "w", encoding="utf-8") as f:
@@ -197,16 +200,14 @@ def concat_wavs_demuxer(wav_paths: list[str], combined_wav: str) -> tuple[bool, 
         pass
     return ok, log
 
-def concat_wavs_filter_complex_to_mp3(wav_paths: list[str], out_mp3: str) -> tuple[bool, str]:
+def concat_wavs_filter_complex_to_mp3(wav_paths: List[str], out_mp3: str) -> Tuple[bool, str]:
     """Concatena WAV usando filter_complex concat e produce MP3 finale."""
     if not wav_paths:
         return False, "No WAV inputs"
     cmd = [FFMPEG_EXE, "-y"]
     for p in wav_paths:
         cmd += ["-i", p]
-    # concat audio-only
     filter_str = f"concat=n={len(wav_paths)}:v=0:a=1"
-    # usa libmp3lame, fallback a 'mp3'
     cmd_lame = cmd + ["-filter_complex", filter_str, "-vn", "-c:a", "libmp3lame", "-q:a", "2", out_mp3]
     ok, log = _run(cmd_lame)
     if ok:
@@ -217,7 +218,7 @@ def concat_wavs_filter_complex_to_mp3(wav_paths: list[str], out_mp3: str) -> tup
 # ---------------------------
 # Sintesi di UN chunk riusando scripts.utils.generate_audio
 # ---------------------------
-def synthesize_single_chunk(text_chunk: str, runtime_cfg: dict, aud_dir: str, idx: int) -> str | None:
+def synthesize_single_chunk(text_chunk: str, runtime_cfg: Dict[str, Any], aud_dir: str, idx: int) -> Optional[str]:
     """
     Genera un singolo chunk audio riusando generate_audio su una cartella temporanea,
     poi rinomina il risultato a chunk_{idx:04d}.mp3 nell'aud_dir.
@@ -240,35 +241,31 @@ def synthesize_single_chunk(text_chunk: str, runtime_cfg: dict, aud_dir: str, id
 # ---------------------------
 # Concat MP3 (robusta, diagnostica)
 # ---------------------------
-def concat_mp3_chunks_robust(script_chunks: list[str], runtime_cfg: dict, aud_dir: str) -> tuple[bool, str]:
+def concat_mp3_chunks_robust(script_chunks: List[str], runtime_cfg: Dict[str, Any], aud_dir: str) -> Tuple[bool, str]:
     """
     1) Convalida ogni chunk mp3 con ffprobe.
-    2) Ricodifica tutti i chunk validi in WAV coerenti. Se un chunk fallisce, lo rigenera 1 volta.
-    3) Concat demuxer WAV -> combined.wav (copy). Se fallisce, usa filter_complex -> MP3 diretto.
-    4) Se tutto ok, encoda MP3 finale (se non prodotto dal passo 3).
+    2) Ricodifica tutti i chunk validi in WAV coerenti (rigenera una volta i chunk difettosi).
+    3) Concat demuxer WAV -> combined.wav (copy), oppure filter_complex -> MP3 diretto.
     Ritorna (ok, path_mp3) oppure (False, errore).
     """
     total_chunks = len(script_chunks)
     if total_chunks == 0:
         return False, "Nessun chunk"
 
-    # 1) validazione + autocorrezione base (file esiste + stream audio)
+    # 1) validazione + autocorrezione base
     invalid = []
     for i in range(total_chunks):
         f = chunk_filename(aud_dir, i)
         if not ffprobe_has_audio(f):
             invalid.append(i)
 
-    # Rigenera una volta gli invalidi
     if invalid:
         st.warning(f"🔁 Rilevati {len(invalid)} chunk MP3 non validi: {invalid[:10]}{'…' if len(invalid)>10 else ''}. Rigenero…")
         for i in invalid:
-            # elimina eventuale file corrotto
             try:
                 os.remove(chunk_filename(aud_dir, i))
             except Exception:
                 pass
-            # rigenera
             out = synthesize_single_chunk(script_chunks[i], runtime_cfg, aud_dir, i)
             if not (out and ffprobe_has_audio(out)):
                 return False, f"Chunk {i} non rigenerabile (MP3 invalido dopo rigenerazione)."
@@ -276,26 +273,24 @@ def concat_mp3_chunks_robust(script_chunks: list[str], runtime_cfg: dict, aud_di
     # 2) normalizza in WAV
     tmp_dir = os.path.join(aud_dir, "_wav_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
-    wav_paths = []
-    bad_after_wav = []
+    wav_paths: List[str] = []
+    bad_after_wav: List[Tuple[int, str]] = []
     for i in range(total_chunks):
         src = chunk_filename(aud_dir, i)
         wav = os.path.join(tmp_dir, f"chunk_{i:04d}.wav")
-        ok, log = mp3_to_wav(src, wav)
+        ok, _ = mp3_to_wav(src, wav)
         if not ok or (not os.path.exists(wav)) or os.path.getsize(wav) <= 0:
-            # ritenta una sola volta: rigenera MP3 e poi riconverte
             out = synthesize_single_chunk(script_chunks[i], runtime_cfg, aud_dir, i)
             if not (out and ffprobe_has_audio(out)):
                 bad_after_wav.append((i, "rigenerazione MP3 fallita"))
                 continue
-            ok2, log2 = mp3_to_wav(out, wav)
+            ok2, _ = mp3_to_wav(out, wav)
             if not ok2 or (not os.path.exists(wav)) or os.path.getsize(wav) <= 0:
                 bad_after_wav.append((i, "transcode WAV fallita dopo rigenerazione"))
                 continue
         wav_paths.append(wav)
 
     if bad_after_wav:
-        # salva log diagnostico
         log_path = os.path.join(aud_dir, "_concat_error.log")
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("Chunk problematici (fase WAV):\n")
@@ -310,7 +305,6 @@ def concat_mp3_chunks_robust(script_chunks: list[str], runtime_cfg: dict, aud_di
     out_mp3 = os.path.join(aud_dir, "combined_audio.mp3")
 
     if ok and os.path.exists(combined_wav) and os.path.getsize(combined_wav) > 0:
-        # encode MP3 dal WAV
         ok2, log2 = _run([FFMPEG_EXE, "-y", "-i", combined_wav, "-vn", "-c:a", "libmp3lame", "-q:a", "2", out_mp3])
         if not ok2:
             ok3, log3 = _run([FFMPEG_EXE, "-y", "-i", combined_wav, "-vn", "-c:a", "mp3", "-q:a", "2", out_mp3])
@@ -318,7 +312,6 @@ def concat_mp3_chunks_robust(script_chunks: list[str], runtime_cfg: dict, aud_di
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return False, f"Encoding MP3 dal WAV fallita: {log2}\n{log3}"
     else:
-        # usa filter_complex per concatenare direttamente a MP3
         ok_fc, log_fc = concat_wavs_filter_complex_to_mp3(wav_paths, out_mp3)
         if not ok_fc:
             log_path = os.path.join(aud_dir, "_concat_error.log")
@@ -339,7 +332,7 @@ def concat_mp3_chunks_robust(script_chunks: list[str], runtime_cfg: dict, aud_di
 # ---------------------------
 # Generazione AUDIO con resume + validazione
 # ---------------------------
-def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str, max_chars: int = 2000) -> str | None:
+def generate_audio_with_resume(script_text: str, runtime_cfg: Dict[str, Any], aud_dir: str, max_chars: int = 2000) -> Optional[str]:
     """
     1) Crea i chunk del testo (~2000 char).
     2) Manifest per resume (completed = solo chunk con stream audio valido).
@@ -370,11 +363,9 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str
         m = expected
         save_manifest(aud_dir, m)
     else:
-        # normalizza
         m["completed"] = sorted(set(int(i) for i in m.get("completed", []) if 0 <= int(i) < total))
         save_manifest(aud_dir, m)
 
-    # Ricalcola 'completed' guardando file e stream audio reale
     completed = set()
     for i in range(total):
         f = chunk_filename(aud_dir, i)
@@ -387,7 +378,6 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str
     prog = st.progress(len(completed) / total if total else 0.0)
     status = st.empty()
 
-    # Genera i soli mancanti
     for i, piece in enumerate(chunks):
         if i in completed:
             status.write(f"✅ Chunk {i+1}/{total} ok, salto.")
@@ -402,7 +392,6 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str
             save_manifest(aud_dir, m)
             prog.progress(len(completed) / total)
         else:
-            # lascia lo stato sul disco per resume
             status.write(f"❌ Chunk {i+1} non valido. Ripremi 'Genera contenuti' per riprovare.")
             return None
 
@@ -422,13 +411,64 @@ def generate_audio_with_resume(script_text: str, runtime_cfg: dict, aud_dir: str
     return final_path
 
 # ---------------------------
+# Risoluzione modello Replicate -> owner/name:version_id
+# ---------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_replicate_model_identifier(model_input: str, token: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Accetta:
+      - "owner/name"
+      - "owner/name:version_or_tag"
+    Se manca la parte dopo ":", interroga l'API Replicate per ottenere default_version (o latest_version). Ritorna:
+      ( "owner/name:version_id", None )  in caso di successo
+      ( None, "messaggio di errore" )    in caso di errore
+    """
+    mi = (model_input or "").strip()
+    if not mi:
+        return None, "Modello vuoto."
+    # se già include ":", si presume risolto
+    if ":" in mi:
+        parts = mi.split(":")
+        if len(parts) == 2 and parts[0].count("/") == 1 and parts[1]:
+            return mi, None
+        # formato strano
+        return None, f"Formato modello non valido: {mi}"
+
+    # deve essere owner/name
+    if mi.count("/") != 1:
+        return None, f"Atteso 'owner/name' (facoltativo ':version'), ricevuto: {mi}"
+
+    if not token:
+        return None, "Replicate API token assente: impossibile risolvere la versione."
+
+    owner, name = mi.split("/", 1)
+    url = f"https://api.replicate.com/v1/models/{owner}/{name}"
+    try:
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        if r.status_code == 200:
+            data = r.json() or {}
+            # Replicate in alcuni casi espone default_version, in altri latest_version
+            ver = (data.get("default_version") or data.get("latest_version") or {}).get("id")
+            if not ver:
+                return None, f"Modello trovato ma senza version id: {mi}"
+            return f"{owner}/{name}:{ver}", None
+        elif r.status_code in (401, 403):
+            return None, "Token non autorizzato a leggere il modello (401/403)."
+        elif r.status_code == 404:
+            return None, "Modello inesistente (404)."
+        else:
+            return None, f"HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return None, f"Errore chiamando Replicate: {e}"
+
+# ---------------------------
 # Pagina
 # ---------------------------
 st.set_page_config(page_title="Generatore Video", page_icon="🎬", layout="centered")
 st.title("🎬 Generatore di Video con Immagini e Audio")
 
 # Carica config opzionale
-base_cfg = {}
+base_cfg: Dict[str, Any] = {}
 if load_config:
     try:
         loaded = load_config()
@@ -520,10 +560,10 @@ with st.sidebar:
 
     custom_prefill = st.session_state.get("replicate_model_custom", "")
     custom_model = st.text_input(
-        "Custom model (owner/name:tag)",
+        "Custom model (owner/name:tag oppure owner/name)",
         value=custom_prefill,
-        placeholder="es. puccincolli/super-image:latest",
-        help="Inserisci il nome completo del modello se usi 'Custom'"
+        placeholder="es. black-forest-labs/flux-1.1  (verrà risolto a owner/name:version_id)",
+        help="Se ometti ':version', risolvo automaticamente la versione di default."
     )
     if custom_model != custom_prefill:
         st.session_state["replicate_model_custom"] = custom_model.strip()
@@ -534,6 +574,15 @@ with st.sidebar:
         else preset_selected
     )
     st.session_state["replicate_model"] = effective_model
+
+    # Verifica modello Replicate (risolve :version)
+    if st.button("Verifica modello Replicate"):
+        tok = _clean_token(st.session_state.get("replicate_api_key", ""))
+        resolved, err = resolve_replicate_model_identifier(effective_model, tok)
+        if resolved:
+            st.success(f"✅ Modello utilizzabile: `{resolved}`")
+        else:
+            st.error(f"❌ Modello non utilizzabile: {err}")
 
 # Funzioni per recuperare stati
 def get_replicate_key() -> str:
@@ -572,18 +621,6 @@ max_chars_audio = st.number_input(
     help="I chunk vengono spezzati dopo i punti dove possibile."
 )
 
-# Input condizionali
-if mode in ["Audio", "Entrambi"]:
-    seconds_per_img = st.number_input(
-        "Ogni quanti secondi di audio creare un'immagine?",
-        min_value=1, value=8, step=1
-    )
-else:  # Solo Immagini
-    sentences_per_image = st.number_input(
-        "Ogni quante frasi creare un'immagine?",
-        min_value=1, value=2, step=1
-    )
-
 generate = st.button("🚀 Genera contenuti")
 
 # ===========================
@@ -602,7 +639,7 @@ if generate and title.strip() and script.strip():
     st.subheader("🔄 Generazione in corso…")
 
     # Config runtime passata ai metodi utils
-    runtime_cfg = dict(base_cfg)  # copia
+    runtime_cfg: Dict[str, Any] = dict(base_cfg)
 
     # Inietta chiavi/parametri scelti dall'utente (puliti)
     replicate_from_ui = _clean_token(get_replicate_key())
@@ -616,24 +653,35 @@ if generate and title.strip() and script.strip():
         os.environ["FISHAUDIO_API_KEY"] = fishaudio_from_ui
         runtime_cfg["fishaudio_api_key"] = fishaudio_from_ui
 
-    # Parametri specifici
-    replicate_model = get_replicate_model()
-    if replicate_model:
-        runtime_cfg["replicate_model"] = replicate_model  # usato in generate_images
+    # Parametri specifici (IMMAGINI): risolviamo il modello -> owner/name:version_id
+    effective = get_replicate_model()
+    if effective:
+        resolved_model, err = resolve_replicate_model_identifier(effective, replicate_from_ui)
+        if resolved_model:
+            runtime_cfg["replicate_model"] = resolved_model  # usato da generate_images
+            runtime_cfg["replicate_model_resolved"] = resolved_model
+            if ":" not in effective:
+                st.caption(f"🔁 Modello risolto automaticamente: `{resolved_model}`")
+        else:
+            # Non blocco: passo comunque il testo originale, ma avviso (così vedi l'errore originale se persistente)
+            runtime_cfg["replicate_model"] = effective
+            st.warning(f"⚠️ Modello non risolto: {err}")
+
+    # Parametri specifici (AUDIO)
     fish_voice = get_fishaudio_voice_id()
     if fish_voice:
-        runtime_cfg["fishaudio_voice_id"] = fish_voice   # usato in generate_audio
+        runtime_cfg["fishaudio_voice_id"] = fish_voice
 
     # Debug (token mascherato + modello)
     st.write(
         "🔐 Replicate token: "
         + _mask(runtime_cfg.get("replicate_api_key") or runtime_cfg.get("replicate_api_token") or os.getenv("REPLICATE_API_TOKEN"))
-        + " · Modello: `"
+        + " · Modello risolto: `"
         + (runtime_cfg.get("replicate_model") or runtime_cfg.get("image_model") or "—")
         + "`"
     )
 
-    # ---- AUDIO (con resume + validazione) ----
+    # ---- AUDIO (con resume) ----
     if mode in ["Audio", "Entrambi"]:
         if not fish_ok:
             st.error("❌ FishAudio API key mancante. Inseriscila nella sidebar.")
@@ -644,6 +692,15 @@ if generate and title.strip() and script.strip():
             final_audio = generate_audio_with_resume(script, runtime_cfg, aud_dir, max_chars=int(max_chars_audio))
             if final_audio:
                 audio_path = final_audio
+                # ✅ Download immediato appena l'audio è pronto
+                st.success("🎉 Audio pronto. Puoi scaricarlo subito mentre genero (eventualmente) le immagini.")
+                st.session_state["audio_path"] = audio_path
+                try:
+                    with open(audio_path, "rb") as f:
+                        st.download_button("🎧 Scarica Audio MP3 (subito)", f, file_name="audio.mp3",
+                                           mime="audio/mpeg", key="dl-audio-early")
+                except Exception:
+                    pass
             else:
                 st.error("⚠️ Audio non completato. Premi di nuovo 'Genera contenuti' per rigenerare eventuali chunk rotti e riprovare la concat.")
                 st.stop()
@@ -652,45 +709,65 @@ if generate and title.strip() and script.strip():
     if mode in ["Immagini", "Entrambi"]:
         if not rep_ok:
             st.error("❌ Replicate API key mancante. Inseriscila nella sidebar.")
-        elif not get_replicate_model():
-            st.error("❌ Modello Replicate mancante. Seleziona un preset o inserisci un Custom model.")
+        elif not runtime_cfg.get("replicate_model"):
+            st.error("❌ Modello Replicate mancante o non risolto.")
         else:
             if mode == "Entrambi":
                 if not os.path.exists(audio_path):
                     st.error("❌ Audio non trovato per calcolare le immagini. Genera prima l’audio.")
                 else:
-                    st.text(f"🖼️ Generazione immagini con modello: {get_replicate_model()} (tempo audio)…")
+                    st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (tempo audio)…")
                     try:
                         duration_sec = mp3_duration_seconds(audio_path)
                     except Exception:
                         duration_sec = 0
                     if not duration_sec:
                         duration_sec = 60  # fallback
-                    num_images = max(1, int(duration_sec // seconds_per_img))
+                    seconds_per_img = 8  # valore di default per 'Entrambi' se non impostato da UI precedente
+                    # Nel vecchio UI questo veniva letto prima; qui fissiamo 8 se non esiste in sessione
+                    try:
+                        seconds_per_img = int(st.session_state.get("seconds_per_img", 8))
+                    except Exception:
+                        pass
+                    num_images = max(1, int(duration_sec // max(1, seconds_per_img)))
                     approx_chars = max(1, len(script) // max(1, num_images))
                     img_chunks = chunk_text(script, approx_chars)
                     st.text(f"🖼️ Generazione di {len(img_chunks)} immagini…")
-                    generate_images(img_chunks, runtime_cfg, img_dir)
-                    zip_images(base)
+                    try:
+                        generate_images(img_chunks, runtime_cfg, img_dir)
+                        zip_images(base)
+                    except Exception as e:
+                        st.error(f"❌ Errore generazione immagini: {e}")
             else:
-                st.text(f"🖼️ Generazione immagini con modello: {get_replicate_model()} (per frasi)…")
-                groups = chunk_by_sentences_count(script, int(sentences_per_image))
+                st.text(f"🖼️ Generazione immagini con modello: {runtime_cfg.get('replicate_model')} (per frasi)…")
+                # default 2 frasi per immagine, se non definito precedentemente
+                sentences_per_image = int(st.session_state.get("sentences_per_image", 2)) or 2
+                groups = chunk_by_sentences_count(script, sentences_per_image)
                 st.text(f"🖼️ Generazione di {len(groups)} immagini (1 ogni {int(sentences_per_image)} frasi)…")
-                generate_images(groups, runtime_cfg, img_dir)
-                zip_images(base)
+                try:
+                    generate_images(groups, runtime_cfg, img_dir)
+                    zip_images(base)
+                except Exception as e:
+                    st.error(f"❌ Errore generazione immagini: {e}")
 
     st.success("✅ Generazione completata!")
 
-    # salva percorsi in sessione per i download
-    st.session_state["audio_path"] = audio_path if os.path.exists(audio_path) else None
+    # salva percorsi in sessione per i download (anche finali)
+    st.session_state["audio_path"] = audio_path if os.path.exists(audio_path) else st.session_state.get("audio_path")
     zip_path = os.path.join(base, "output.zip")
     st.session_state["zip_path"] = zip_path if os.path.exists(zip_path) else None
 
 # ---- Download (chiavi uniche per evitare DuplicateElementId) ----
 if st.session_state.get("audio_path") and os.path.exists(st.session_state["audio_path"]):
-    with open(st.session_state["audio_path"], "rb") as f:
-        st.download_button("🎧 Scarica Audio MP3", f, file_name="audio.mp3", mime="audio/mpeg", key="dl-audio")
+    try:
+        with open(st.session_state["audio_path"], "rb") as f:
+            st.download_button("🎧 Scarica Audio MP3", f, file_name="audio.mp3", mime="audio/mpeg", key="dl-audio-final")
+    except Exception:
+        pass
 
 if st.session_state.get("zip_path") and os.path.exists(st.session_state["zip_path"]):
-    with open(st.session_state["zip_path"], "rb") as f:
-        st.download_button("🖼️ Scarica ZIP Immagini", f, file_name="output.zip", mime="application/zip", key="dl-zip")
+    try:
+        with open(st.session_state["zip_path"], "rb") as f:
+            st.download_button("🖼️ Scarica ZIP Immagini", f, file_name="output.zip", mime="application/zip", key="dl-zip")
+    except Exception:
+        pass

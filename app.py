@@ -158,7 +158,10 @@ def move_single_output(src_dir: str, dst_fullpath_no_ext: str, preferred_exts) -
     files.sort(key=lambda n: os.path.getmtime(os.path.join(src_dir, n)))
     src = os.path.join(src_dir, files[-1])  # prendi il PIÙ recente
     ext = files[-1].split(".")[-1].lower()
-    # se formato sconosciuto, manteniamo l'estensione corrente
+    if ext not in preferred_exts:
+        # se formato sconosciuto, fall back all'estensione preferita, ma NON rinominiamo "a caso"
+        # salviamo col suo ext; eventuale transcodifica avverrà nel combine
+        pass
     dst = f"{dst_fullpath_no_ext}.{ext}"
     try:
         os.replace(src, dst)
@@ -312,6 +315,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
                 tmp_mp3,
             ], capture_output=True, text=True)
             if r.returncode != 0:
+                # transcodifica fallita
                 return False
             mp3_parts.append(tmp_mp3)
         except Exception:
@@ -321,20 +325,19 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     def _posix(pth: str) -> str:
         return os.path.abspath(pth).replace("\\", "/")
 
-    filelist = os.path.join(tmp_dir, "list.txt")
+    filelist == os.path.join(tmp_dir, "list.txt")
     try:
-        with open(filelist, "w", encoding="utf-8") as f:
+       with open(filelist, "w", encoding="utf-8") as f:
             for p in mp3_parts:
                 f.write(f"file '{_posix(p)}'\n")
 
-        r = subprocess.run([
+        r = subprocess.run([([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
             "-i", filelist,
             "-c:a", "libmp3lame", "-b:a", "192k",
             out_path,
         ], capture_output=True, text=True)
-
         if r.returncode == 0 and os.path.exists(out_path):
             # cleanup
             for n in os.listdir(tmp_dir):
@@ -344,7 +347,6 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
                     pass
             return True
     except Exception:
-        # andiamo al fallback
         pass
 
     # 3) PROVA B) fallback concat filter
@@ -371,7 +373,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
 
 
 # -------------------------------------------------------
-# Timeline (view semplice)
+# Timeline (uguale alla tua, con micro-fix)
 # -------------------------------------------------------
 class ProgressTracker:
     def __init__(self):
@@ -435,8 +437,6 @@ class ProgressTracker:
             return 0
         completed = len([s for s in self.steps if s["status"] == "completed"])
         return min(100, (completed / len(self.steps)) * 100)
-
-
 def display_timeline(tracker: ProgressTracker, container):
     """Unica vista semplice: due barre di avanzamento (Audio/Immagini)."""
     try:
@@ -481,8 +481,11 @@ def display_timeline(tracker: ProgressTracker, container):
             st.metric("Completate", f"{i_done}/{i_total}" if i_total else "—")
             st.progress((i_done / i_total) if i_total else 0.0)
 
+        # tempo semplice (non ETA)
         st.caption("La barra si aggiorna ad ogni chunk completato.")
 
+# -------------------------------------------------------
+# Streamlit UIarra si aggiorna ad ogni chunk completato.")
 
 # -------------------------------------------------------
 # Streamlit UI
@@ -553,55 +556,37 @@ with st.sidebar:
     st.divider()
     st.subheader("🎯 Prompt fisso immagini")
     use_fixed = st.checkbox("Usa prompt fisso per immagini", value=True, key="use_fixed_prompt_images")
-    fixed_prompt = st.text_area(
-        "Prompt fisso (opzionale)",
-        value=st.session_state.get("fixed_prompt_images", ""),
-        height=120,
-        help="Se impostato, verrà unito ai prompt generati per ogni immagine.",
-    )
-    st.session_state["fixed_prompt_images"] = fixed_prompt.strip()
+    fixed_de
+speed_mode = st.selectbox("Modalità", ["🐌 Lenta", "⚡ Veloce", "🚀 Turbo"], index=1)
+# Imposta una base (sleep) in base alla modalità
+if speed_mode == "⚡ Veloce":
+    st.session_state["chunk_size"] = 3500
+    st.session_state["sleep_time"] = 5
+elif speed_mode == "🚀 Turbo":
+    st.session_state["chunk_size"] = 5000
+    st.session_state["sleep_time"] = 2
+else:
+    st.session_state["chunk_size"] = 2000
+    st.session_state["sleep_time"] = 11
 
-    st.divider()
-    speed_mode = st.selectbox("Modalità", ["🐌 Lenta", "⚡ Veloce", "🚀 Turbo"], index=1)
-    # Imposta una base (sleep) in base alla modalità
-    if speed_mode == "⚡ Veloce":
-        st.session_state["chunk_size"] = 3500
-        st.session_state["sleep_time"] = 5
-    elif speed_mode == "🚀 Turbo":
-        st.session_state["chunk_size"] = 5000
-        st.session_state["sleep_time"] = 2
-    else:
-        st.session_state["chunk_size"] = 2000
-        st.session_state["sleep_time"] = 11
+# ✅ Opzione per avere chunk ~durata target (stima)
+use_dur = st.checkbox("Imposta chunk per durata target", value=True, help="Calcola automaticamente il chunk_size in base ai secondi desiderati e a una velocità di parlato stimata.")
+if use_dur:
+    target_secs = st.number_input("Durata target chunk (s)", min_value=30, max_value=600, value=120, step=10, key="target_chunk_secs")
+    cps_est = st.number_input("Parlato stimato (caratteri/s)", min_value=8.0, max_value=25.0, value=16.0, step=0.5, key="cps_est")
+    st.session_state["chunk_size"] = int(target_secs * cps_est)
+    st.caption(f"Chunk stimato ≈ {st.session_state['chunk_size']} caratteri (~{st.session_state['chunk_size']/(cps_est*60):.1f} min)")
 
-    # ✅ Opzione per avere chunk ~durata target (stima)
-    use_dur = st.checkbox(
-        "Imposta chunk per durata target",
-        value=True,
-        help="Calcola automaticamente il chunk_size in base ai secondi desiderati e a una velocità di parlato stimata.",
-    )
-    if use_dur:
-        target_secs = st.number_input(
-            "Durata target chunk (s)", min_value=30, max_value=600, value=120, step=10, key="target_chunk_secs"
-        )
-        cps_est = st.number_input(
-            "Parlato stimato (caratteri/s)", min_value=8.0, max_value=25.0, value=16.0, step=0.5, key="cps_est"
-        )
-        st.session_state["chunk_size"] = int(target_secs * cps_est)
-        st.caption(
-            f"Chunk stimato ≈ {st.session_state['chunk_size']} caratteri (~{st.session_state['chunk_size']/(cps_est*60):.1f} min)"
-        )
-
-    st.divider()
-    st.header("🔄 Resume & Sblocco")
-    if st.button("🔓 Sblocca progetto corrente"):
+st.divider()
+st.header("🔄 Resume & Sblocco")
+if st.button("🔓 Sblocca progetto corrente"):
         t = st.session_state.get("title", "")
         if t:
             clear_lock(os.path.join("data", "outputs", sanitize(t)))
         st.session_state["is_generating"] = False
         st.success("Sbloccato. Puoi riprendere.")
         st.rerun()
-    if st.button("🧹 Sblocca tutti i progetti"):
+if st.button("🧹 Sblocca tutti i progetti"):
         base_root = "data/outputs"
         n = 0
         if os.path.exists(base_root):
@@ -659,15 +644,11 @@ with col_main:
     mode = st.selectbox("Cosa vuoi generare?", ["Immagini", "Audio", "Entrambi"], index=2)
 
     if mode in ["Audio", "Entrambi"]:
-        seconds_per_img = st.number_input(
-            "Ogni quanti secondi creare un'immagine?", min_value=1, value=8, step=1
-        )
+        seconds_per_img = st.number_input("Ogni quanti secondi creare un'immagine?", min_value=1, value=8, step=1)
         st.session_state["seconds_per_img"] = seconds_per_img
     else:
         sentences_per_image = st.number_input("Quante frasi per immagine?", min_value=1, value=2, step=1)
         st.session_state["sentences_per_image"] = sentences_per_image
-
-    generate = st.button("🚀 Genera contenuti", use_container_width=True)
 
     # ----- Stato resume + pulsanti -----
     resume_audio_btn_clicked = False
@@ -713,13 +694,14 @@ with col_main:
                     st.session_state["resume_start_image_idx"] = i_done
                     resume_images_btn_clicked = True
         else:
-            st.info(f"🖼️ Immagini: **{i_done}** create (totale non ancora pianificato)")
-
-with col_timeline:
+            st.info(f"🖼️ Immagini: **{i_done}** create (totale with col_timeline:
     st.subheader("📊 Avanzamento")
     timeline_container = st.empty()
     if not st.session_state.get("is_generating", False):
         with timeline_container.container():
+            st.info("⏳ Premi 'Genera contenuti' o un pulsante 'Continua…' per iniziare / riprendere")
+
+# triggerner:
             st.info("⏳ Premi 'Genera contenuti' o un pulsante 'Continua…' per iniziare / riprendere")
 
 # trigger
@@ -749,8 +731,8 @@ if trigger_generate and title.strip() and script.strip():
     state = StateStore(base)
 
     # API / Modello
-    rep_key = get_replicate_key()
-    fish_key = get_fishaudio_key()
+    rep_key = (st.session_state.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN", "")).strip()
+    fish_key = (st.session_state.get("fish_audio_api_key") or os.environ.get("FISHAUDIO_API_KEY", "")).strip()
     model = get_replicate_model()
     voice = get_fishaudio_voice_id()
 
@@ -791,8 +773,6 @@ if trigger_generate and title.strip() and script.strip():
         runtime_cfg["fishaudio_voice_id"] = voice
     runtime_cfg["chunk_size"] = get_chunk_size()
     runtime_cfg["sleep_time"] = get_sleep_time()
-    runtime_cfg["use_fixed_prompt_images"] = bool(st.session_state.get("use_fixed_prompt_images", False))
-    runtime_cfg["fixed_prompt_images"] = st.session_state.get("fixed_prompt_images", "")
 
     # Flag + lock
     st.session_state["is_generating"] = True
@@ -907,15 +887,13 @@ if trigger_generate and title.strip() and script.strip():
                     img_chunks_plan = [script]
                 else:
                     per_img = max(1, len(sents) // num_images)
-                    img_chunks_plan = [" ".join(sents[i: i + per_img]) for i in range(0, len(sents), per_img)]
+                    img_chunks_plan = [" ".join(sents[i : i + per_img]) for i in range(0, len(sents), per_img)]
                 json_list_save(os.path.join(base, "image_chunks.json"), img_chunks_plan)
             else:
                 if not img_chunks_plan:
                     img_chunks_plan = json_list_load(os.path.join(base, "image_chunks.json")) or []
                     if not img_chunks_plan:
-                        img_chunks_plan = chunk_by_sentences_count(
-                            script, int(st.session_state.get("sentences_per_image", 2))
-                        )
+                        img_chunks_plan = chunk_by_sentences_count(script, int(st.session_state.get("sentences_per_image", 2)))
                         json_list_save(os.path.join(base, "image_chunks.json"), img_chunks_plan)
 
             total_imgs = len(img_chunks_plan)
@@ -988,6 +966,7 @@ if trigger_generate and title.strip() and script.strip():
     except Exception as e:
         st.error(f"💥 ERRORE: {e}")
         import traceback
+
         st.code(traceback.format_exc())
     finally:
         clear_lock(base)
@@ -1007,7 +986,7 @@ with c1:
         ap = st.session_state["audio_path"]
         try:
             size_mb = os.path.getsize(ap) / (1024 * 1024)
-            dur = mp3_duration_seconds(ap) or 0
+            dur = mp3_duration_seconds(ap)
             bitrate = (size_mb * 8 * 1024) / dur if dur > 0 else 0
             st.info(f"Durata: {dur:.1f}s · Dimensione: {size_mb:.1f} MB · ~{bitrate:.0f} kbps")
         except Exception:
@@ -1035,4 +1014,4 @@ with c2:
                 use_container_width=True,
             )
     else:
-        st.info("⏳ Nessun pacchetto immagini pronto")
+        st

@@ -325,13 +325,13 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     def _posix(pth: str) -> str:
         return os.path.abspath(pth).replace("\\", "/")
 
-    filelist = os.path.join(tmp_dir, "list.txt")
+    filelist == os.path.join(tmp_dir, "list.txt")
     try:
-        with open(filelist, "w", encoding="utf-8") as f:
+       with open(filelist, "w", encoding="utf-8") as f:
             for p in mp3_parts:
                 f.write(f"file '{_posix(p)}'\n")
 
-        r = subprocess.run([
+        r = subprocess.run([([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
             "-i", filelist,
@@ -437,41 +437,55 @@ class ProgressTracker:
             return 0
         completed = len([s for s in self.steps if s["status"] == "completed"])
         return min(100, (completed / len(self.steps)) * 100)
-
-
 def display_timeline(tracker: ProgressTracker, container):
-    if not tracker.start_time:
-        return
-    with container:
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.metric("⏱️ Trascorso", f"{tracker.get_elapsed_time()/60:.1f} min")
-        with c2:
-            st.metric("🎯 ETA", f"{tracker.get_eta()/60:.1f} min")
-        with c3:
-            total = (tracker.get_elapsed_time() + tracker.get_eta()) / 60
-            st.metric("📊 Totale Stimato", f"{total:.1f} min")
-        with c4:
-            completed = len([s for s in tracker.steps if s["status"] == "completed"])
-            st.metric("✅ Completati", f"{completed}/{len(tracker.steps)}")
-        st.progress(tracker.get_completion_percentage() / 100, text=f"{tracker.get_completion_percentage():.1f}%")
-        st.markdown("### 📋 Timeline Dettagliata")
-        for s in tracker.steps:
-            icon = "🔄" if s["status"] == "running" else ("✅" if s["status"] == "completed" else "❌")
-            style = "**" if s["status"] == "running" else ""
-            if s["duration"]:
-                tstr = f"({s['duration']:.1f}s)"
-            elif s["status"] == "running":
-                tstr = f"({(datetime.now()-s['start_time']).total_seconds():.1f}s...)"
-            else:
-                tstr = ""
-            st.markdown(f"{icon} {style}{s['description']}{style} {tstr}")
-            if s["substeps"]:
-                show = s["substeps"][-3:] if s["status"] == "running" else s["substeps"][-1:]
-                for sub in show:
-                    sub_icon = "✅" if sub["status"] == "completed" else "❌"
-                    st.markdown(f"   └ {sub_icon} {sub['description']}")
+    """Unica vista semplice: due barre di avanzamento (Audio/Immagini)."""
+    try:
+        container.empty()
+    except Exception:
+        pass
 
+    # Calcola progresso leggendo lo stato dal filesystem
+    title_cur = st.session_state.get("title", "")
+    a_done = a_total = i_done = i_total = 0
+    if title_cur:
+        base = os.path.join("data", "outputs", sanitize(title_cur))
+        aud_dir = os.path.join(base, "audio")
+        img_dir = os.path.join(base, "images")
+
+        if os.path.exists(aud_dir):
+            a_done = contiguous_from_zero(existing_part_indices(aud_dir, "part", AUDIO_EXTS))
+        if os.path.exists(img_dir):
+            i_done = contiguous_from_zero(existing_part_indices(img_dir, "img", IMAGE_EXTS))
+
+        acp = os.path.join(base, "audio_chunks.json")
+        icp = os.path.join(base, "image_chunks.json")
+        try:
+            if os.path.exists(acp):
+                a_total = len(json_list_load(acp) or [])
+        except Exception:
+            a_total = 0
+        try:
+            if os.path.exists(icp):
+                i_total = len(json_list_load(icp) or [])
+        except Exception:
+            i_total = 0
+
+    with container.container():
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### 🎧 Audio")
+            st.metric("Completati", f"{a_done}/{a_total}" if a_total else "—")
+            st.progress((a_done / a_total) if a_total else 0.0)
+        with c2:
+            st.markdown("#### 🖼️ Immagini")
+            st.metric("Completate", f"{i_done}/{i_total}" if i_total else "—")
+            st.progress((i_done / i_total) if i_total else 0.0)
+
+        # tempo semplice (non ETA)
+        st.caption("La barra si aggiorna ad ogni chunk completato.")
+
+# -------------------------------------------------------
+# Streamlit UIarra si aggiorna ad ogni chunk completato.")
 
 # -------------------------------------------------------
 # Streamlit UI
@@ -540,7 +554,9 @@ with st.sidebar:
     st.session_state["replicate_model"] = effective_model
 
     st.divider()
-    st.subheader("⚡ Velocità")
+    st.subheader("🎯 Prompt fisso immagini")
+    use_fixed = st.checkbox("Usa prompt fisso per immagini", value=True, key="use_fixed_prompt_images")
+    fixed_de
 speed_mode = st.selectbox("Modalità", ["🐌 Lenta", "⚡ Veloce", "🚀 Turbo"], index=1)
 # Imposta una base (sleep) in base alla modalità
 if speed_mode == "⚡ Veloce":
@@ -678,15 +694,14 @@ with col_main:
                     st.session_state["resume_start_image_idx"] = i_done
                     resume_images_btn_clicked = True
         else:
-            st.info(f"🖼️ Immagini: **{i_done}** create (totale non ancora determinato)")
-
-    generate = st.button("🚀 Genera contenuti", type="primary", use_container_width=True)
-
-with col_timeline:
-    st.subheader("📊 Timeline Generazione")
-    timeline_container = st.container()
+            st.info(f"🖼️ Immagini: **{i_done}** create (totale with col_timeline:
+    st.subheader("📊 Avanzamento")
+    timeline_container = st.empty()
     if not st.session_state.get("is_generating", False):
-        with timeline_container:
+        with timeline_container.container():
+            st.info("⏳ Premi 'Genera contenuti' o un pulsante 'Continua…' per iniziare / riprendere")
+
+# triggerner:
             st.info("⏳ Premi 'Genera contenuti' o un pulsante 'Continua…' per iniziare / riprendere")
 
 # trigger
@@ -999,10 +1014,4 @@ with c2:
                 use_container_width=True,
             )
     else:
-        st.info("⏳ Nessuna immagine pronta")
-
-st.markdown("---")
-st.markdown(
-    "<div style='text-align:center;color:#666;padding:12px'>🎬 Generatore Video AI — Resume a prova di crash • Pulsanti 'Continua da chunk N'</div>",
-    unsafe_allow_html=True,
-)
+        st

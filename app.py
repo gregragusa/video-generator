@@ -323,14 +323,13 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
 
     # 2) PROVA A) concat demuxer con list.txt (percorsi POSIX)
     def _posix(pth: str) -> str:
-        return os.path.abspath(pth).replace("\", "/")
+        return os.path.abspath(pth).replace("\\", "/")
 
     filelist = os.path.join(tmp_dir, "list.txt")
     try:
         with open(filelist, "w", encoding="utf-8") as f:
             for p in mp3_parts:
-                f.write(f"file '{_posix(p)}'
-")
+                f.write(f"file '{_posix(p)}'\n")
 
         r = subprocess.run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -342,8 +341,10 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
         if r.returncode == 0 and os.path.exists(out_path):
             # cleanup
             for n in os.listdir(tmp_dir):
-                try: os.remove(os.path.join(tmp_dir, n))
-                except Exception: pass
+                try:
+                    os.remove(os.path.join(tmp_dir, n))
+                except Exception:
+                    pass
             return True
     except Exception:
         pass
@@ -562,15 +563,14 @@ if use_dur:
 
 st.divider()
 st.header("🔄 Resume & Sblocco")
-    if st.button("🔓 Sblocca progetto corrente"):
+if st.button("🔓 Sblocca progetto corrente"):
         t = st.session_state.get("title", "")
         if t:
             clear_lock(os.path.join("data", "outputs", sanitize(t)))
         st.session_state["is_generating"] = False
         st.success("Sbloccato. Puoi riprendere.")
         st.rerun()
-
-    if st.button("🧹 Sblocca tutti i progetti"):
+if st.button("🧹 Sblocca tutti i progetti"):
         base_root = "data/outputs"
         n = 0
         if os.path.exists(base_root):

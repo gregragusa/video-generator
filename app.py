@@ -38,7 +38,7 @@ AUDIO_EXTS = ("mp3", "wav", "m4a")
 IMAGE_EXTS = ("png", "jpg", "jpeg")
 STATE_FILENAME = "state.json"  # checkpoint unificato per questo progetto
 GEN_TIMEOUT_SECS = 10 * 60
-
+SILENCE_BETWEEN_PARTS_SECS = 0.8  # ✅ ~0.5–1.0s tra gli spezzoni audio
 
 def sanitize(title: str) -> str:
     s = (title or "").lower()
@@ -248,65 +248,40 @@ def json_list_load(path: str) -> list | None:
 
 def build_or_load_audio_chunks(base: str, script: str, chunk_size: int) -> list:
     """
-    UNICA MODIFICA RICHIESTA:
-    - Anche se esiste un chunk_size dinamico, forziamo i chunk audio a essere SEMPRE < 1000 caratteri.
-    - Manteniamo il resto del flusso invariato (cache su file, stessa API).
+    ✅ MODIFICA #1:
+    - Usa un target di ~1000 caratteri ma NON tronca mai una frase.
+    - Greedy packing: aggiunge frasi finché restiamo intorno a 1000; se una singola frase supera il target, la tiene da sola.
+    - Manteniamo cache su file invariata.
     """
     path = os.path.join(base, "audio_chunks.json")
     cached = json_list_load(path)
     if cached:
         return cached
 
-    # Limite HARD: ogni chunk deve essere < 1000 caratteri
-    MAX_CHARS = 999
+    TARGET = 1000  # circa, non rigido: priorità = finire la frase
+    sents = sentences_from_script(script)
 
-    # 1) Primo pass con l'utility esistente, ma tagliando al massimo consentito
-    initial_target = min(chunk_size or MAX_CHARS, MAX_CHARS)
-    chunks = chunk_text_for_audio(script, target_chars=initial_target)
-
-    # 2) Pass di sicurezza: se qualche chunk supera il limite, splittiamo ulteriormente
-    sentence_splitter = re.compile(r"(?<=[.?!])\s+")
-    def strict_split(text: str) -> list[str]:
-        if len(text) <= MAX_CHARS:
-            return [text]
-        # Prova a splittare per frasi e impacchettare greedy < 1000
-        sents = [s.strip() for s in sentence_splitter.split(text.strip()) if s.strip()]
-        if not sents:
-            # fallback brutale a blocchi duri
-            return [text[i:i+MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
-        acc = []
-        cur = ""
-        for s in sents:
-            # +1 spazio se necessario
-            add = ((" " if cur else "") + s)
-            if len(cur) + len(add) <= MAX_CHARS:
-                cur += add
-            else:
-                if cur:
-                    acc.append(cur)
-                if len(s) <= MAX_CHARS:
-                    cur = s
-                else:
-                    # frase singola troppo lunga: taglio duro
-                    parts = [s[i:i+MAX_CHARS] for i in range(0, len(s), MAX_CHARS)]
-                    if parts:
-                        acc.extend(parts[:-1])
-                        cur = parts[-1]
-                    else:
-                        cur = ""
-        if cur:
-            acc.append(cur)
-        return acc
-
-    final_chunks: list[str] = []
-    for c in chunks:
-        if len(c) <= MAX_CHARS:
-            final_chunks.append(c)
+    chunks: list[str] = []
+    cur = ""
+    for s in sents:
+        s = s.strip()
+        if not s:
+            continue
+        candidate = (f"{cur} {s}".strip()) if cur else s
+        if cur and len(candidate) > TARGET:
+            # chiudi il chunk precedente a fine frase
+            chunks.append(cur)
+            cur = s
         else:
-            final_chunks.extend(strict_split(c))
+            cur = candidate
+    if cur:
+        chunks.append(cur)
 
-    json_list_save(path, final_chunks)
-    return final_chunks
+    # Se lo split di cui sopra produce un primo chunk vuoto (non dovrebbe), ripulisci
+    chunks = [c.strip() for c in chunks if c and c.strip()]
+
+    json_list_save(path, chunks)
+    return chunks
 
 
 def sentences_from_script(script: str) -> list:
@@ -314,7 +289,7 @@ def sentences_from_script(script: str) -> list:
 
 
 # -------------------------------------------------------
-# Combine Audio robusto (gestisce formati misti)
+# Combine Audio robusto (gestisce formati misti) + pausa tra parti
 # -------------------------------------------------------
 
 def list_audio_parts(aud_dir: str) -> list[str]:
@@ -330,8 +305,8 @@ def list_audio_parts(aud_dir: str) -> list[str]:
 def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     """
     Concatena i part_*.audio in un unico MP3 con due strategie:
-    1) Demuxer concat con file list.txt (percorsi in stile POSIX per Windows)
-    2) Fallback: concat filter (decodifica e ricodifica) con -filter_complex
+    1) Demuxer concat con file list.txt + ✅ inserimento di un segmento di silenzio (~0.8s) tra i pezzi
+    2) Fallback: concat filter (decodifica e ricodifica) con -filter_complex (senza silenzio se il primo step fallisce)
     Restituisce True se out_path viene creato correttamente.
     """
     parts = list_audio_parts(aud_dir)
@@ -368,23 +343,38 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
                 tmp_mp3,
             ], capture_output=True, text=True)
             if r.returncode != 0:
-                # transcodifica fallita
                 return False
             mp3_parts.append(tmp_mp3)
         except Exception:
             return False
 
-    # 2) PROVA A) concat demuxer con list.txt (percorsi POSIX)
+    # 2) PROVA A) concat demuxer con silenzio tra le parti
     def _posix(pth: str) -> str:
         return os.path.abspath(pth).replace("\\", "/")
 
-    filelist == os.path.join(tmp_dir, "list.txt")
-    try:
-       with open(filelist, "w", encoding="utf-8") as f:
-            for p in mp3_parts:
-                f.write(f"file '{_posix(p)}'\n")
+    filelist = os.path.join(tmp_dir, "list.txt")
+    silence_file = os.path.join(tmp_dir, "silence.mp3")
 
-        r = subprocess.run([([
+    try:
+        # genera un pezzetto di silenzio ~0.8s
+        r_sil = subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", f"{SILENCE_BETWEEN_PARTS_SECS}",
+            "-c:a", "libmp3lame", "-b:a", "192k",
+            silence_file
+        ], capture_output=True, text=True)
+        if r_sil.returncode != 0 or not os.path.exists(silence_file):
+            raise RuntimeError("silence_gen_failed")
+
+        # costruisci la lista alternando parte + silenzio (niente silenzio dopo l'ultima)
+        with open(filelist, "w", encoding="utf-8") as f:
+            for idx, p in enumerate(mp3_parts):
+                f.write(f"file '{_posix(p)}'\n")
+                if idx < len(mp3_parts) - 1:
+                    f.write(f"file '{_posix(silence_file)}'\n")
+
+        r = subprocess.run([
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-f", "concat", "-safe", "0",
             "-i", filelist,
@@ -402,7 +392,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     except Exception:
         pass
 
-    # 3) PROVA B) fallback concat filter
+    # 3) PROVA B) fallback concat filter (senza silenzio)
     try:
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
         for p in mp3_parts:

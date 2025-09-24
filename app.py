@@ -247,13 +247,66 @@ def json_list_load(path: str) -> list | None:
 
 
 def build_or_load_audio_chunks(base: str, script: str, chunk_size: int) -> list:
+    """
+    UNICA MODIFICA RICHIESTA:
+    - Anche se esiste un chunk_size dinamico, forziamo i chunk audio a essere SEMPRE < 1000 caratteri.
+    - Manteniamo il resto del flusso invariato (cache su file, stessa API).
+    """
     path = os.path.join(base, "audio_chunks.json")
     cached = json_list_load(path)
     if cached:
         return cached
-    chunks = chunk_text_for_audio(script, target_chars=chunk_size)
-    json_list_save(path, chunks)
-    return chunks
+
+    # Limite HARD: ogni chunk deve essere < 1000 caratteri
+    MAX_CHARS = 999
+
+    # 1) Primo pass con l'utility esistente, ma tagliando al massimo consentito
+    initial_target = min(chunk_size or MAX_CHARS, MAX_CHARS)
+    chunks = chunk_text_for_audio(script, target_chars=initial_target)
+
+    # 2) Pass di sicurezza: se qualche chunk supera il limite, splittiamo ulteriormente
+    sentence_splitter = re.compile(r"(?<=[.?!])\s+")
+    def strict_split(text: str) -> list[str]:
+        if len(text) <= MAX_CHARS:
+            return [text]
+        # Prova a splittare per frasi e impacchettare greedy < 1000
+        sents = [s.strip() for s in sentence_splitter.split(text.strip()) if s.strip()]
+        if not sents:
+            # fallback brutale a blocchi duri
+            return [text[i:i+MAX_CHARS] for i in range(0, len(text), MAX_CHARS)]
+        acc = []
+        cur = ""
+        for s in sents:
+            # +1 spazio se necessario
+            add = ((" " if cur else "") + s)
+            if len(cur) + len(add) <= MAX_CHARS:
+                cur += add
+            else:
+                if cur:
+                    acc.append(cur)
+                if len(s) <= MAX_CHARS:
+                    cur = s
+                else:
+                    # frase singola troppo lunga: taglio duro
+                    parts = [s[i:i+MAX_CHARS] for i in range(0, len(s), MAX_CHARS)]
+                    if parts:
+                        acc.extend(parts[:-1])
+                        cur = parts[-1]
+                    else:
+                        cur = ""
+        if cur:
+            acc.append(cur)
+        return acc
+
+    final_chunks: list[str] = []
+    for c in chunks:
+        if len(c) <= MAX_CHARS:
+            final_chunks.append(c)
+        else:
+            final_chunks.extend(strict_split(c))
+
+    json_list_save(path, final_chunks)
+    return final_chunks
 
 
 def sentences_from_script(script: str) -> list:

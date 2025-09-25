@@ -5,8 +5,8 @@
 # ✅ Pulsanti "Continua da chunk N" + Auto-Restore con "Genera contenuti"
 # ✅ Combine audio affidabile anche con formati misti (mp3/wav/m4a)
 # ✅ Nessuna dipendenza da funzioni di checkpoint esterne
-# ✅ MOD: Chunk audio ~1000 char a fine frase + pausa tra chunk (~0.8s)
-# ✅ MOD: Cambio Voice (model) ID forza rigenerazione e viene propagato via env e cfg
+# ✅ Chunk audio ~1000 char a fine frase + pausa tra chunk (~0.8s)
+# ✅ VOCE PREDEFINITA FishAudio impostata nel codice
 # -------------------------------------------------------
 
 import os
@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover
 # utils base (richiesti)
 from scripts.utils import (  # type: ignore
     chunk_by_sentences_count,
-    chunk_text_for_audio,   # compat
+    chunk_text_for_audio,   # presente per compatibilità con altri punti
     generate_audio,
     generate_images,
     mp3_duration_seconds,
@@ -40,13 +40,21 @@ AUDIO_EXTS = ("mp3", "wav", "m4a")
 IMAGE_EXTS = ("png", "jpg", "jpeg")
 STATE_FILENAME = "state.json"  # checkpoint unificato per questo progetto
 GEN_TIMEOUT_SECS = 10 * 60
-SILENCE_BETWEEN_PARTS_SECS = 0.8  # pausa tra chunk audio
+SILENCE_BETWEEN_PARTS_SECS = 0.8  # pausa tra un chunk audio e il successivo (0.5–1.0s ok)
+
+# 👇 VOCE PREDEFINITA FishAudio (puoi sovrascriverla da UI o ENV)
+DEFAULT_FISHAUDIO_VOICE_ID = "80e34d5e0b2b4577a486f3a77e357261"
+
 
 def sanitize(title: str) -> str:
     s = (title or "").lower()
-    for a, b in [(" ", "_"), ("ù", "u"), ("à", "a"), ("è", "e"), ("ì", "i"), ("ò", "o"), ("é", "e")]:
+    for a, b in [
+        (" ", "_"), ("ù", "u"), ("à", "a"), ("è", "e"),
+        ("ì", "i"), ("ò", "o"), ("é", "e"),
+    ]:
         s = s.replace(a, b)
     return "".join(ch for ch in s if ch.isalnum() or ch == "_") or "video"
+
 
 def sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -93,11 +101,13 @@ class StateStore:
 def _lock_path(base_dir: str) -> str:
     return os.path.join(base_dir, ".generation.lock")
 
+
 def write_lock(base_dir: str):
     os.makedirs(base_dir, exist_ok=True)
     data = {"start_ts": time.time(), "last_progress_ts": time.time()}
     with open(_lock_path(base_dir), "w", encoding="utf-8") as f:
         json.dump(data, f)
+
 
 def touch_progress(base_dir: str):
     try:
@@ -112,6 +122,7 @@ def touch_progress(base_dir: str):
     except Exception:
         pass
 
+
 def is_lock_stale(base_dir: str, timeout_secs: int = GEN_TIMEOUT_SECS) -> bool:
     p = _lock_path(base_dir)
     try:
@@ -123,6 +134,7 @@ def is_lock_stale(base_dir: str, timeout_secs: int = GEN_TIMEOUT_SECS) -> bool:
         return (time.time() - last) > timeout_secs
     except Exception:
         return True
+
 
 def clear_lock(base_dir: str):
     try:
@@ -144,13 +156,17 @@ def ensure_empty_dir(path: str):
         except Exception:
             pass
 
+
 def move_single_output(src_dir: str, dst_fullpath_no_ext: str, preferred_exts) -> str | None:
     files = [n for n in os.listdir(src_dir) if not n.startswith(".")]
     if not files:
         return None
     files.sort(key=lambda n: os.path.getmtime(os.path.join(src_dir, n)))
-    src = os.path.join(src_dir, files[-1])
+    src = os.path.join(src_dir, files[-1])  # prendi il PIÙ recente
     ext = files[-1].split(".")[-1].lower()
+    if ext not in preferred_exts:
+        # salviamo col suo ext; eventuale transcodifica avverrà nel combine
+        pass
     dst = f"{dst_fullpath_no_ext}.{ext}"
     try:
         os.replace(src, dst)
@@ -161,12 +177,14 @@ def move_single_output(src_dir: str, dst_fullpath_no_ext: str, preferred_exts) -
             os.remove(src)
         except Exception:
             pass
+    # pulizia residui
     for n in os.listdir(src_dir):
         try:
             os.remove(os.path.join(src_dir, n))
         except Exception:
             pass
     return dst
+
 
 def existing_part_indices(dir_path: str, prefix: str, exts) -> list[int]:
     inds = []
@@ -184,12 +202,14 @@ def existing_part_indices(dir_path: str, prefix: str, exts) -> list[int]:
             inds.append(int(m.group(1)))
     return sorted(inds)
 
+
 def contiguous_from_zero(indices: list[int]) -> int:
     s = set(indices)
     i = 0
     while i in s:
         i += 1
     return i
+
 
 def zip_images(base_dir: str) -> str | None:
     import zipfile
@@ -217,6 +237,7 @@ def json_list_save(path: str, items: list):
         json.dump(items, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+
 def json_list_load(path: str) -> list | None:
     if os.path.exists(path):
         try:
@@ -233,15 +254,16 @@ def json_list_load(path: str) -> list | None:
 # SPLIT AUDIO: ~1000 caratteri, sempre a fine frase
 # -------------------------------------------------------
 def sentences_from_script(script: str) -> list:
-    # split per . ? ! con spazio/newline successivo
+    # split robusto per . ? ! e spazi successivi
     return [s.strip() for s in re.split(r"(?<=[.?!])\s+", script.strip()) if s.strip()]
+
 
 def build_or_load_audio_chunks(base: str, script: str, chunk_size: int) -> list:
     """
-    Split greedy per frasi con target ≈1000 caratteri per chunk.
-    - Non taglia parole o frasi.
-    - Se una singola frase supera 1000, la teniamo intera.
-    - Aggiunge un punto se il chunk non termina con .?!
+    Split greedy per frasi con target ≈1000 char per chunk.
+    - Non taglia MAI parole o frasi.
+    - Se una singola frase supera i 1000, la teniamo intera (come richiesto).
+    - Aggiunge un punto finale se il chunk non termina con .?!
     - Cache su file; invalida se cambia lo script.
     """
     path = os.path.join(base, "audio_chunks.json")
@@ -293,7 +315,7 @@ def build_or_load_audio_chunks(base: str, script: str, chunk_size: int) -> list:
 
 
 # -------------------------------------------------------
-# Combine Audio + pausa tra parti
+# Combine Audio robusto (gestisce formati misti) + pausa tra parti
 # -------------------------------------------------------
 def list_audio_parts(aud_dir: str) -> list[str]:
     files = []
@@ -304,12 +326,13 @@ def list_audio_parts(aud_dir: str) -> list[str]:
             files.append(os.path.join(aud_dir, n))
     return files
 
+
 def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     """
-    Concatena i part_*.audio in un unico MP3:
-    - Normalizza ogni parte in mp3 44.1kHz stereo 192kbps
-    - Inserisce ~0.8s di silenzio tra pezzi
-    - concat demuxer; fallback: filter_complex
+    Concatena i part_*.audio in un unico MP3.
+    1) Normalizza ogni parte in mp3 44.1kHz stereo 192kbps
+    2) Inserisce ~0.8s di silenzio dopo ogni parte (tranne l'ultima)
+    3) Concat demuxer; fallback: filter_complex
     """
     parts = list_audio_parts(aud_dir)
     if not parts:
@@ -349,7 +372,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
         except Exception:
             return False
 
-    # 2) silenzio
+    # 2) genera silenzio
     silence_mp3 = os.path.join(tmp_dir, "silence.mp3")
     try:
         r_sil = subprocess.run([
@@ -364,7 +387,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     except Exception:
         silence_mp3 = None
 
-    # 3) pezzo + silenzio (tranne ultimo)
+    # 3) appende silenzio a ogni parte (tranne l'ultima)
     mp3_with_silence: list[str] = []
     for i, p in enumerate(mp3_parts):
         if silence_mp3 and i < len(mp3_parts) - 1:
@@ -383,6 +406,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     # 4) concat demuxer
     def _posix(pth: str) -> str:
         return os.path.abspath(pth).replace("\\", "/")
+
     filelist = os.path.join(tmp_dir, "list.txt")
     try:
         with open(filelist, "w", encoding="utf-8") as f:
@@ -397,6 +421,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
             out_path,
         ], capture_output=True, text=True)
         if r.returncode == 0 and os.path.exists(out_path):
+            # cleanup
             for n in os.listdir(tmp_dir):
                 try:
                     os.remove(os.path.join(tmp_dir, n))
@@ -421,6 +446,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
     except Exception:
         return False
     finally:
+        # cleanup temporanei
         for n in os.listdir(tmp_dir):
             try:
                 os.remove(os.path.join(tmp_dir, n))
@@ -494,6 +520,7 @@ class ProgressTracker:
         completed = len([s for s in self.steps if s["status"] == "completed"])
         return min(100, (completed / len(self.steps)) * 100)
 
+
 def display_timeline(tracker: ProgressTracker, container):
     """Due barre di avanzamento (Audio/Immagini)."""
     try:
@@ -508,7 +535,7 @@ def display_timeline(tracker: ProgressTracker, container):
         aud_dir = os.path.join(base, "audio")
         img_dir = os.path.join(base, "images")
 
-        if os.path.exists(aud_dir)):
+        if os.path.exists(aud_dir):
             a_done = contiguous_from_zero(existing_part_indices(aud_dir, "part", AUDIO_EXTS))
         if os.path.exists(img_dir):
             i_done = contiguous_from_zero(existing_part_indices(img_dir, "img", IMAGE_EXTS))
@@ -580,9 +607,10 @@ with st.sidebar:
 
     st.divider()
     st.header("⚙️ Parametri")
-    voice_prefill = st.session_state.get("fishaudio_voice_id", "")
-    fish_voice_id = st.text_input("FishAudio Voice ID (o Voice Model ID)", value=voice_prefill)
-    if fish_voice_id != voice_prefill:
+    # Prefill con VOCE PREDEFINITA se non c'è in sessione/env
+    voice_prefill = st.session_state.get("fishaudio_voice_id") or os.environ.get("FISHAUDIO_VOICE_ID") or DEFAULT_FISHAUDIO_VOICE_ID
+    fish_voice_id = st.text_input("FishAudio Voice ID", value=voice_prefill)
+    if fish_voice_id != st.session_state.get("fishaudio_voice_id"):
         st.session_state["fishaudio_voice_id"] = fish_voice_id.strip()
 
     model_presets = [
@@ -630,7 +658,10 @@ with st.sidebar:
         target_secs = st.number_input("Durata target chunk (s)", min_value=30, max_value=600, value=120, step=10, key="target_chunk_secs")
         cps_est = st.number_input("Parlato stimato (caratteri/s)", min_value=8.0, max_value=25.0, value=16.0, step=0.5, key="cps_est")
         st.session_state["chunk_size"] = int(target_secs * cps_est)
-        st.caption(f"Chunk stimato ≈ {st.session_state['chunk_size']} caratteri (~{st.session_state['chunk_size']/(cps_est*60):.1f} min)")
+        st.caption(
+            f"Chunk stimato ≈ {st.session_state['chunk_size']} caratteri "
+            f"(~{st.session_state['chunk_size']/(cps_est*60):.1f} min)"
+        )
 
     st.divider()
     st.header("🔄 Resume & Sblocco")
@@ -661,20 +692,31 @@ with st.sidebar:
 def get_replicate_key() -> str:
     return (st.session_state.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN", "")).strip()
 
+
 def get_fishaudio_key() -> str:
     return (st.session_state.get("fish_audio_api_key") or os.environ.get("FISHAUDIO_API_KEY", "")).strip()
 
+
 def get_fishaudio_voice_id() -> str:
-    return st.session_state.get("fishaudio_voice_id", "").strip()
+    # 👉 usa la VOCE PREDEFINITA se non viene fornita altrove
+    return (
+        st.session_state.get("fishaudio_voice_id")
+        or os.environ.get("FISHAUDIO_VOICE_ID")
+        or DEFAULT_FISHAUDIO_VOICE_ID
+    ).strip()
+
 
 def get_replicate_model() -> str:
     return st.session_state.get("replicate_model", "").strip()
 
+
 def get_chunk_size() -> int:
     return st.session_state.get("chunk_size", 2000)
 
+
 def get_sleep_time() -> float:
     return st.session_state.get("sleep_time", 11.0)
+
 
 st.write(
     f"🔎 **Stato API** → Replicate: {'✅' if get_replicate_key() else '⚠️'} · "
@@ -698,6 +740,7 @@ with col_main:
         sentences_per_image = st.number_input("Quante frasi per immagine?", min_value=1, value=2, step=1)
         st.session_state["sentences_per_image"] = sentences_per_image
 
+    # pulsante master
     generate = st.button("🚀 Genera contenuti", use_container_width=True)
 
     # ----- Stato resume + pulsanti -----
@@ -755,27 +798,7 @@ with col_timeline:
 trigger_generate = generate or resume_audio_btn_clicked or resume_images_btn_clicked
 
 # -------------------------------------------------------
-# Voice injection helper — PROPAGA OVUNQUE
-# -------------------------------------------------------
-def _inject_voice(runtime_cfg: dict, voice: str):
-    """Rende il voice/model id visibile a qualunque implementazione di generate_audio()."""
-    if not voice:
-        return
-    # Env comuni
-    for k in [
-        "FISHAUDIO_VOICE_ID", "FISHAUDIO_VOICE", "FISHAUDIO_SPEAKER", "FISHAUDIO_SPEAKER_ID",
-        "VOICE_ID", "VOICE", "SPEAKER", "SPEAKER_ID",
-    ]:
-        os.environ[k] = voice
-    # Chiavi cfg comuni
-    for k in [
-        "fishaudio_voice_id", "fishaudio_voice", "fishaudio_speaker", "fishaudio_speaker_id",
-        "voice_id", "voice", "speaker", "speaker_id",
-    ]:
-        runtime_cfg[k] = voice
-
-# -------------------------------------------------------
-# Driver di generazione (resume + bottoni dedicati)
+# Driver di generazione (resume automatico + bottoni dedicati)
 # -------------------------------------------------------
 if trigger_generate and title.strip() and script.strip():
     # evita doppia generazione
@@ -801,7 +824,7 @@ if trigger_generate and title.strip() and script.strip():
     rep_key = get_replicate_key()
     fish_key = get_fishaudio_key()
     model = get_replicate_model()
-    voice = get_fishaudio_voice_id()
+    voice = get_fishaudio_voice_id()  # 👉 include la voce predefinita se mancante
 
     forced_resume_mode = st.session_state.get("resume_mode")  # "audio" | "images" | None
     effective_mode = mode
@@ -836,36 +859,21 @@ if trigger_generate and title.strip() and script.strip():
         runtime_cfg["fishaudio_api_key"] = fish_key
     if model:
         runtime_cfg["replicate_model"] = model
+    # 👉 Propaga la voice (predefinita o scelta) anche su ENV per massima compatibilità
+    os.environ["FISHAUDIO_VOICE_ID"] = voice
+    runtime_cfg["fishaudio_voice_id"] = voice
+
     runtime_cfg["chunk_size"] = get_chunk_size()
     runtime_cfg["sleep_time"] = get_sleep_time()
-
-    # 👉 forza la voce ovunque
-    _inject_voice(runtime_cfg, voice)
 
     # Flag + lock
     st.session_state["is_generating"] = True
     st.session_state["title"] = title
     write_lock(base)
 
-    # Reset automatico se cambia Voice
-    prev_voice = state.get("voice_id")
-    if voice and prev_voice and voice != prev_voice:
-        try:
-            for n in os.listdir(aud_dir):
-                if n.startswith("part_") or n == "combined_audio.mp3":
-                    try:
-                        os.remove(os.path.join(aud_dir, n))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        state.update(audio_completed=0)
-        st.info(f"🔁 Voice cambiata: rigenero gli spezzoni con `{voice}`.")
-    state.update(voice_id=voice)
-
     tracker = ProgressTracker()
 
-    # Chunk audio
+    # Chunk deterministici per AUDIO
     audio_chunks = (
         build_or_load_audio_chunks(base, script, runtime_cfg["chunk_size"])
         if effective_mode in ["Audio", "Entrambi"]
@@ -909,7 +917,7 @@ if trigger_generate and title.strip() and script.strip():
                 start_idx = max(completed_cp, leading_files)
 
             total = len(audio_chunks)
-            tracker.add_substep(step, f"📦 Ripartenza audio: {start_idx} su {total} (prossimo: {start_idx+1})", "completed")
+            tracker.add_substep(step, f"📦 Ripartenza audio: {start_idx} su {total} (prossimo: chunk {start_idx+1})", "completed")
             display_timeline(tracker, timeline_container)
 
             for i in range(start_idx, total):
@@ -920,7 +928,7 @@ if trigger_generate and title.strip() and script.strip():
                 try:
                     generate_audio([audio_chunks[i]], runtime_cfg, tmp, progress_cb=_progress)  # type: ignore
                 except TypeError:
-                    generate_audio([audio_chunks[i]], runtime_cfg, tmp)
+                    generate_audio([audio_chunks[i]], runtime_cfg, tmp)  # compat vecchie utils
 
                 target_noext = os.path.join(aud_dir, f"part_{i:03d}")
                 out = move_single_output(tmp, target_noext, preferred_exts=AUDIO_EXTS)
@@ -936,7 +944,7 @@ if trigger_generate and title.strip() and script.strip():
                 display_timeline(tracker, timeline_container)
                 touch_progress(base)
 
-            # combine in mp3
+            # combine sempre in mp3 (anche se part_* sono wav/m4a)
             combined = os.path.join(aud_dir, "combined_audio.mp3")
             ok = combine_parts_to_mp3(aud_dir, combined)
             if ok:
@@ -945,7 +953,7 @@ if trigger_generate and title.strip() and script.strip():
                 try:
                     tracker.add_substep(step, f"🎵 Combinato: {mp3_duration_seconds(combined):.1f}s", "completed")
                 except Exception:
-                    tracker.add_substep(step, "🎵 Combinato", "completed")
+                    tracker.add_substep(step, f"🎵 Combinato", "completed")
             else:
                 tracker.add_substep(step, "ℹ️ ffmpeg non disponibile o combine fallito: restano i part_*.audio", "completed")
 
@@ -958,6 +966,7 @@ if trigger_generate and title.strip() and script.strip():
             display_timeline(tracker, timeline_container)
 
             if effective_mode == "Entrambi":
+                # richiede audio combinato per calcolare planning immagini
                 audio_path = os.path.join(aud_dir, "combined_audio.mp3")
                 if not os.path.exists(audio_path):
                     st.error("❌ Audio combinato non trovato: completa l'audio prima di creare le immagini.")
@@ -972,7 +981,7 @@ if trigger_generate and title.strip() and script.strip():
                     img_chunks_plan = [script]
                 else:
                     per_img = max(1, len(sents) // num_images)
-                    img_chunks_plan = [" ".join(sents[i:i + per_img]) for i in range(0, len(sents), per_img)]
+                    img_chunks_plan = [" ".join(sents[i: i + per_img]) for i in range(0, len(sents), per_img)]
                 json_list_save(os.path.join(base, "image_chunks.json"), img_chunks_plan)
             else:
                 if not img_chunks_plan:
@@ -1049,7 +1058,7 @@ if trigger_generate and title.strip() and script.strip():
     except Exception as e:
         st.error(f"💥 ERRORE: {e}")
         import traceback
-        st.code(traceback.format_traceback())
+        st.code(traceback.format_exc())
     finally:
         clear_lock(base)
         st.session_state["is_generating"] = False

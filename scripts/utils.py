@@ -1,7 +1,7 @@
 # scripts/utils.py
 # -------------------------------------------------------
 # Utility: chunking testo + IMMAGINI (Replicate) + AUDIO (FishAudio)
-# VERSIONE CON SISTEMA RESUME/CHECKPOINT per script lunghi
+# Versione robusta anti-taglio + supporto voce forzata
 # -------------------------------------------------------
 
 import os
@@ -12,63 +12,76 @@ from io import BytesIO
 import base64
 import json
 import glob
+import shutil
+from typing import List, Optional
 
 import requests
 from PIL import Image
 
-# ============== Checkpoint System ==============
+# ======================= Costanti =======================
+
+AUDIO_EXTS = ("mp3", "wav", "m4a")
+IMAGE_EXTS = ("png", "jpg", "jpeg")
+
+# Silenzi per migliorare il TTS
+TAIL_SILENCE_SECS = 0.25            # silenzio alla fine di ogni clip
+BETWEEN_SILENCE_SECS = 0.8          # silenzio tra clip nel merge finale
+
+# Voce di default (se non arriva da cfg/env)
+DEFAULT_FISHAUDIO_VOICE_ID = "80e34d5e0b2b4577a486f3a77e357261"
+
+# ================== Checkpoint (compat) =================
 
 def save_checkpoint(base_dir: str, data: dict):
-    """Salva checkpoint per resume"""
-    checkpoint_path = os.path.join(base_dir, "checkpoint.json")
+    cp = os.path.join(base_dir, "checkpoint.json")
     os.makedirs(base_dir, exist_ok=True)
-    with open(checkpoint_path, "w", encoding="utf-8") as f:
+    with open(cp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    print(f"[CHECKPOINT] Salvato: {checkpoint_path}")
 
 def load_checkpoint(base_dir: str) -> dict:
-    """Carica checkpoint esistente"""
-    checkpoint_path = os.path.join(base_dir, "checkpoint.json")
-    if os.path.exists(checkpoint_path):
+    cp = os.path.join(base_dir, "checkpoint.json")
+    if os.path.exists(cp):
         try:
-            with open(checkpoint_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            print(f"[CHECKPOINT] Caricato: {checkpoint_path}")
-            return data
-        except Exception as e:
-            print(f"[CHECKPOINT] Errore caricamento: {e}")
+            with open(cp, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
     return {}
 
 def clear_checkpoint(base_dir: str):
-    """Rimuove checkpoint completato"""
-    checkpoint_path = os.path.join(base_dir, "checkpoint.json")
-    if os.path.exists(checkpoint_path):
-        try:
-            os.remove(checkpoint_path)
-            print(f"[CHECKPOINT] Rimosso: {checkpoint_path}")
-        except Exception:
-            pass
+    cp = os.path.join(base_dir, "checkpoint.json")
+    try:
+        if os.path.exists(cp):
+            os.remove(cp)
+    except Exception:
+        pass
 
 def get_completed_files(directory: str, pattern: str) -> list:
-    """Trova file già completati"""
     if not os.path.exists(directory):
         return []
     return sorted(glob.glob(os.path.join(directory, pattern)))
 
-# ============== Helper Functions ==============
+# ================== Streamlit helper ====================
 
 def _st():
-    """Helper per importare Streamlit solo se disponibile"""
     try:
         import streamlit as st
         return st
     except Exception:
         return None
 
-# ============== Chunking Functions ==============
+# =================== Chunking testo =====================
+
+def _normalize_trailing_for_tts(text: str) -> str:
+    """Assicura terminazione con .?! e spazio finale (aiuta alcuni TTS a non troncare)."""
+    s = (text or "").rstrip()
+    if s and s[-1] not in ".?!":
+        s += "."
+    if not s.endswith(" "):
+        s += " "
+    return s
 
 def chunk_text(text: str, max_chars: int):
-    """Chunking base per caratteri"""
     words = (text or "").split()
     parts, curr, length = [], [], 0
     for w in words:
@@ -83,13 +96,12 @@ def chunk_text(text: str, max_chars: int):
     return parts
 
 def chunk_by_sentence(text: str, max_chars: int):
-    """Chunking per frasi con limite caratteri"""
     sentences = re.split(r'(?<=[.?!])\s+', (text or "").strip())
     parts, curr = [], ""
     for sent in sentences:
-        candidate = (curr + " " + sent).strip() if curr else sent.strip()
-        if len(candidate) <= max_chars:
-            curr = candidate
+        cand = (curr + " " + sent).strip() if curr else sent.strip()
+        if len(cand) <= max_chars:
+            curr = cand
         else:
             if curr:
                 parts.append(curr)
@@ -99,82 +111,56 @@ def chunk_by_sentence(text: str, max_chars: int):
     return parts
 
 def chunk_by_sentences_count(text: str, sentences_per_chunk: int):
-    """Chunking per numero di frasi"""
     sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', (text or "").strip()) if s.strip()]
     N = max(1, int(sentences_per_chunk or 1))
     return [" ".join(sentences[i:i + N]) for i in range(0, len(sentences), N)]
 
 def chunk_text_for_audio(text: str, target_chars: int = 2000, max_chars: int = 4000):
-    """
-    Chunking specifico per audio - gestisce script lunghi
-    """
+    """Chunking per audio: accumula frasi fino al target, mai spezzare parole; spezza parole solo oltre max_chars."""
     if not text:
         return []
-    
-    original_length = len(text)
-    if original_length <= target_chars:
-        return [text]
-    
-    # Dividi per frasi (supporta . ? ! ;)
+    if len(text) <= target_chars:
+        return [_normalize_trailing_for_tts(text)]
+
     sentences = re.split(r'(?<=[.?!;])\s+', text.strip())
-    
     chunks = []
-    current_chunk = ""
-    
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
+    current = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
             continue
-            
-        # Test se aggiungendo questa frase supero il target
-        test_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
-        
-        if len(test_chunk) <= target_chars:
-            current_chunk = test_chunk
+        test = (current + " " + s).strip() if current else s
+        if len(test) <= target_chars:
+            current = test
         else:
-            # Se la frase è troppo lunga, spezzala intelligentemente
-            if len(sentence) > max_chars:
-                # Salva chunk corrente se non vuoto
-                if current_chunk:
-                    chunks.append(current_chunk)
-                    current_chunk = ""
-                
-                # Spezza la frase lunga per parole
-                words = sentence.split()
-                temp_chunk = ""
-                for word in words:
-                    test_word = (temp_chunk + " " + word).strip() if temp_chunk else word
-                    if len(test_word) <= max_chars:
-                        temp_chunk = test_word
+            if len(s) > max_chars:
+                if current:
+                    chunks.append(_normalize_trailing_for_tts(current))
+                    current = ""
+                # spezza per parole ma senza spezzare parole stesse
+                words = s.split()
+                buf = ""
+                for w in words:
+                    cand = (buf + " " + w).strip() if buf else w
+                    if len(cand) <= max_chars:
+                        buf = cand
                     else:
-                        if temp_chunk:
-                            chunks.append(temp_chunk)
-                        if len(word) > max_chars:
-                            # Spezza parole troppo lunghe
-                            for j in range(0, len(word), max_chars):
-                                chunks.append(word[j:j + max_chars])
-                            temp_chunk = ""
-                        else:
-                            temp_chunk = word
-                
-                if temp_chunk:
-                    current_chunk = temp_chunk
+                        if buf:
+                            chunks.append(_normalize_trailing_for_tts(buf))
+                        buf = w
+                if buf:
+                    current = buf
             else:
-                # Salva chunk corrente e inizia nuovo
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = sentence
-    
-    # Aggiungi ultimo chunk
-    if current_chunk:
-        chunks.append(current_chunk)
-    
+                if current:
+                    chunks.append(_normalize_trailing_for_tts(current))
+                current = s
+    if current:
+        chunks.append(_normalize_trailing_for_tts(current))
     return chunks
 
-# ============== Image Generation ==============
+# ================== IMMAGINI (Replicate) =================
 
 def save_image_from_url(url: str, path: str, timeout: int = 60):
-    """Scarica e salva immagine da URL"""
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
     img = Image.open(BytesIO(r.content))
@@ -184,27 +170,21 @@ def save_image_from_url(url: str, path: str, timeout: int = 60):
     img.save(path)
 
 def _download_first(urls, dest_path: str):
-    """Scarica la prima URL disponibile"""
     if not urls:
         raise ValueError("Nessuna URL immagine restituita dal modello.")
     save_image_from_url(urls[0], dest_path)
     return dest_path
 
 def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float = None):
-    """
-    Genera immagini usando Replicate con sistema RESUME
-    """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
 
-    # Estrai configurazione
     api_key = (cfg or {}).get("replicate_api_token") or (cfg or {}).get("replicate_api_key") or os.getenv("REPLICATE_API_TOKEN")
     model = (cfg or {}).get("image_model") or (cfg or {}).get("replicate_model")
     extra_input = (cfg or {}).get("replicate_input", {})
-    
-    # Sleep dinamico
+
     if sleep_between_calls is None:
-        sleep_between_calls = cfg.get("sleep_time", 11.0)
+        sleep_between_calls = (cfg or {}).get("sleep_time", 11.0)
 
     if not api_key:
         msg = "Replicate API token assente."
@@ -215,671 +195,38 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
         if st: st.error("❌ " + msg)
         raise ValueError(msg)
 
-    # CHECKPOINT: Carica stato precedente
-    base_dir = os.path.dirname(outdir)
-    checkpoint = load_checkpoint(base_dir)
-    
-    # Trova immagini già generate
-    existing_images = get_completed_files(outdir, "img_*.png")
-    completed_count = len(existing_images)
-    
-    if completed_count > 0:
-        if st:
-            st.info(f"🔄 **RESUME DETECTED**: {completed_count} immagini già generate, continuando da dove interrotto...")
-        else:
-            print(f"[RESUME] Found {completed_count} existing images, resuming...")
-
-    # Normalizza nome modello
-    if ":" not in model:
-        model = f"{model}:latest"
-        if st and completed_count == 0:  # Solo la prima volta
-            st.info(f"🔧 Aggiunto tag :latest → `{model}`")
-
-    # Inizializza client Replicate
-    import replicate
-    client = replicate.Client(api_token=api_key)
-
-    # Info debug (solo se è la prima volta)
-    if completed_count == 0:
-        masked = (api_key[:3] + "…" + api_key[-4:]) if len(api_key) > 8 else "—"
-        if st:
-            st.write(f"🔐 Token: {masked} | 🧩 Modello: `{model}`")
-
-    results = existing_images.copy()  # Includi immagini già generate
-    failed_chunks = []
-    start_time = time.time()
-
-    # Progress bar
-    if st:
-        progress_bar = st.progress(completed_count / len(chunks))
-        status_text = st.empty()
-        status_text.write(f"🎨 Iniziando da immagine {completed_count + 1}/{len(chunks)}...")
-    else:
-        progress_bar = None
-        status_text = None
-    
-    # Genera solo le immagini mancanti
-    for idx in range(completed_count + 1, len(chunks) + 1):
-        prompt = chunks[idx - 1]  # chunks è 0-indexed, idx è 1-indexed
-        
-        # Aggiorna progress bar
-        if progress_bar and status_text:
-            progress = (idx - 1) / len(chunks)
-            progress_bar.progress(progress)
-            elapsed = time.time() - start_time
-            if idx > completed_count + 1:
-                avg_time = elapsed / (idx - completed_count - 1)
-                eta = avg_time * (len(chunks) - idx + 1)
-                status_text.write(f"🎨 Immagine {idx}/{len(chunks)} - ETA: {eta/60:.1f} min")
-            else:
-                status_text.write(f"🎨 Immagine {idx}/{len(chunks)}...")
-        elif st:
-            st.write(f"🎨 Generando immagine {idx}/{len(chunks)}...")
-
-        model_input = {"prompt": prompt}
-        model_input.setdefault("aspect_ratio", (cfg or {}).get("aspect_ratio", "16:9"))
-        if isinstance(extra_input, dict):
-            model_input.update(extra_input)
-
-        try:
-            output = client.run(model, input=model_input)
-            
-            # Estrai URLs
-            urls = []
-            if isinstance(output, str):
-                urls = [output]
-            elif isinstance(output, list):
-                urls = output
-            elif isinstance(output, dict):
-                for k in ("image", "images", "output", "url", "urls"):
-                    v = output.get(k)
-                    if isinstance(v, str):
-                        urls = [v]; break
-                    if isinstance(v, list) and v:
-                        urls = v; break
-
-            outpath = os.path.join(outdir, f"img_{idx:03d}.png")
-            _download_first(urls, outpath)
-            results.append(outpath)
-
-            # CHECKPOINT: Salva progresso
-            checkpoint_data = {
-                "images_completed": idx,
-                "total_images": len(chunks),
-                "last_updated": time.time(),
-                "model": model
-            }
-            save_checkpoint(base_dir, checkpoint_data)
-
-            # Successo
-            if st:
-                elapsed = time.time() - start_time
-                total_elapsed = elapsed if completed_count == 0 else elapsed  # tempo solo per questa sessione
-                st.write(f"✅ Immagine {idx}/{len(chunks)}: `{os.path.basename(outpath)}` (sessione: {total_elapsed/60:.1f} min)")
-
-        except Exception as e:
-            failed_chunks.append(idx)
-            if st:
-                st.error(f"❌ Errore immagine {idx}: {e}")
-                st.warning(f"💾 **Progresso salvato**: {idx-1} immagini completate. Riavvia per continuare.")
-            
-            # Salva checkpoint anche in caso di errore
-            checkpoint_data = {
-                "images_completed": idx - 1,  # Ultima immagine completata con successo
-                "total_images": len(chunks),
-                "last_updated": time.time(),
-                "model": model,
-                "failed_chunks": failed_chunks
-            }
-            save_checkpoint(base_dir, checkpoint_data)
-            
-            # Continua con le altre (non interrompere tutto)
-            continue
-
-        # Sleep tra chiamate
-        if sleep_between_calls > 0 and idx < len(chunks):
-            time.sleep(sleep_between_calls)
-
-    # Cleanup progress bar
-    if progress_bar:
-        progress_bar.progress(1.0)
-        if status_text:
-            completed_new = len(results) - completed_count
-            status_text.write(f"✅ Completate {completed_new} nuove immagini ({len(results)} totali)")
-        time.sleep(1)
-        progress_bar.empty()
-        if status_text:
-            status_text.empty()
-
-    # Report finale
-    if failed_chunks and st:
-        st.warning(f"⚠️ {len(failed_chunks)} immagini fallite su {len(chunks)} totali")
-    
-    # Se completato tutto, rimuovi checkpoint
-    if len(results) >= len(chunks):
-        clear_checkpoint(base_dir)
-        if st:
-            st.success(f"🎉 **Tutte le {len(chunks)} immagini completate!** Checkpoint rimosso.")
-    
-    if not results:
-        raise RuntimeError("Nessuna immagine generata con successo.")
-
-    return results
-
-# ============== Audio Generation ==============
-
-def mp3_duration_seconds(path: str) -> float:
-    """Ritorna la durata in secondi usando mutagen"""
-    try:
-        from mutagen.mp3 import MP3
-        return float(MP3(path).info.length)
-    except Exception:
-        return 0.0
-
-def concat_mp3s(paths, out_path: str, bitrate_kbps: int = 128):
-    """Concatena MP3 usando ffmpeg con fallback"""
-    if not paths:
-        raise RuntimeError("Nessun file MP3 da concatenare.")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    # Prova ffmpeg
-    ffmpeg_bin = None
-    
-    try:
-        import imageio_ffmpeg
-        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        import shutil
-        ffmpeg_bin = shutil.which("ffmpeg")
-    
-    if not ffmpeg_bin:
-        return _concat_mp3s_alternative(paths, out_path)
-
-    list_path = out_path + ".txt"
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in paths:
-            abspath = os.path.abspath(p)
-            f.write(f"file '{abspath}'\n")
-
-    cmd = [
-        ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k", out_path,
-    ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode()[:200]}")
-    
-    try:
-        os.remove(list_path)
-    except Exception:
-        pass
-
-def _concat_mp3s_alternative(paths, out_path: str):
-    """Fallback concatenazione senza ffmpeg"""
-    with open(out_path, 'wb') as outfile:
-        for i, path in enumerate(paths):
-            with open(path, 'rb') as infile:
-                if i == 0:
-                    outfile.write(infile.read())
-                else:
-                    data = infile.read()
-                    # Cerca sync frame MP3
-                    for j in range(min(1000, len(data) - 1)):
-                        if data[j] == 0xFF and (data[j+1] & 0xE0) == 0xE0:
-                            outfile.write(data[j:])
-                            break
-                    else:
-                        outfile.write(data)
-    return out_path
-
-def _download_with_retry(url: str, retries: int = 5, timeout: int = 60) -> bytes:
-    """Download con retry"""
-    last_exc = None
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, timeout=timeout)
-            r.raise_for_status()
-            return r.content
-        except Exception as e:
-            last_exc = e
-            if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1))
-    raise last_exc or RuntimeError("Download fallito")
-
-def generate_audio(chunks, cfg: dict, outdir: str, tts_endpoint: str = "https://api.fish.audio/v1/tts"):
-    """
-    Genera audio usando FishAudio TTS con sistema RESUME
-    """
-    st = _st()
-    os.makedirs(outdir, exist_ok=True)
-    
-    # Estrai configurazione
-    api_key = (cfg or {}).get("fishaudio_api_key")
-    voice_id = (cfg or {}).get("fishaudio_voice") or (cfg or {}).get("fishaudio_voice_id")
-    model = (cfg or {}).get("fishaudio_model")
-    extra = (cfg or {}).get("fishaudio_extra", {})
-
-    if not api_key:
-        msg = "FishAudio API key assente."
-        if st: st.error("❌ " + msg)
-        raise ValueError(msg)
-    if not voice_id:
-        msg = "FishAudio Voice ID assente."
-        if st: st.error("❌ " + msg)
-        raise ValueError(msg)
-
-    # CHECKPOINT: Carica stato precedente
-    base_dir = os.path.dirname(outdir)
-    checkpoint = load_checkpoint(base_dir)
-    
-    # Trova file audio già generati
-    existing_audio = get_completed_files(outdir, "audio_*.mp3")
-    completed_count = len(existing_audio)
-    
-    if completed_count > 0:
-        if st:
-            st.info(f"🔄 **RESUME DETECTED**: {completed_count} chunk audio già generati, continuando da dove interrotto...")
-        else:
-            print(f"[RESUME] Found {completed_count} existing audio chunks, resuming...")
-
-    # Info chunking (solo se è la prima volta)
-    if completed_count == 0:
-        total_chars = sum(len(chunk) for chunk in chunks)
-        avg_chars = total_chars / len(chunks) if chunks else 0
-        
-        if st:
-            st.info(f"📊 Audio: {len(chunks)} segmenti | {total_chars:,} caratteri | Media: {avg_chars:.0f}")
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    if model:
-        headers["model"] = model
-
-    audio_paths = existing_audio.copy()  # Includi file già generati
-    failed_count = 0
-    start_time = time.time()
-
-    # Progress bar
-    if st:
-        progress_bar = st.progress(completed_count / len(chunks))
-        status_text = st.empty()
-        status_text.write(f"🎧 Iniziando da chunk {completed_count + 1}/{len(chunks)}...")
-    else:
-        progress_bar = None
-        status_text = None
-
-    # Genera solo i chunk mancanti
-    for i in range(completed_count + 1, len(chunks) + 1):
-        text = chunks[i - 1]  # chunks è 0-indexed, i è 1-indexed
-        
-        # Aggiorna progress
-        if progress_bar and status_text:
-            progress = (i - 1) / len(chunks)
-            progress_bar.progress(progress)
-            elapsed = time.time() - start_time
-            if i > completed_count + 1:
-                avg_time = elapsed / (i - completed_count - 1)
-                eta = avg_time * (len(chunks) - i + 1)
-                status_text.write(f"🎧 Chunk {i}/{len(chunks)} - ETA: {eta/60:.1f} min")
-            else:
-                status_text.write(f"🎧 Chunk {i}/{len(chunks)}...")
-        elif st:
-            st.write(f"🎧 Generando audio {i}/{len(chunks)} ({len(text)} caratteri)...")
-
-        payload = {
-            "text": text,
-            "reference_id": voice_id,
-            "format": "mp3",
-            "mp3_bitrate": 128,
-        }
-        if model:
-            payload["model"] = model
-        if isinstance(extra, dict):
-            payload.update(extra)
-
-        try:
-            resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=180)
-            
-            if resp.status_code >= 400:
-                failed_count += 1
-                if st:
-                    st.error(f"❌ HTTP {resp.status_code} chunk {i}")
-                    st.warning(f"💾 **Progresso salvato**: {i-1} chunk completati. Riavvia per continuare.")
-                
-                # Salva checkpoint anche in caso di errore
-                checkpoint_data = {
-                    "audio_completed": i - 1,
-                    "total_chunks": len(chunks),
-                    "last_updated": time.time(),
-                    "voice_id": voice_id
-                }
-                save_checkpoint(base_dir, checkpoint_data)
-                continue
-
-            # Processa risposta
-            ct = resp.headers.get("Content-Type", "")
-            if "application/json" in ct:
-                data = resp.json()
-                audio_url = data.get("audio_url") or data.get("url")
-                audio_b64 = data.get("audio_base64") or data.get("audio")
-                
-                if audio_url:
-                    audio_bytes = _download_with_retry(audio_url)
-                elif audio_b64:
-                    audio_bytes = base64.b64decode(audio_b64)
-                else:
-                    failed_count += 1
-                    continue
-            else:
-                audio_bytes = resp.content
-
-            # Salva file
-            path = os.path.join(outdir, f"audio_{i:03d}.mp3")
-            with open(path, "wb") as f:
-                f.write(audio_bytes)
-
-            dur_sec = mp3_duration_seconds(path)
-            audio_paths.append(path)
-            
-            # CHECKPOINT: Salva progresso
-            checkpoint_data = {
-                "audio_completed": i,
-                "total_chunks": len(chunks),
-                "last_updated": time.time(),
-                "voice_id": voice_id
-            }
-            save_checkpoint(base_dir, checkpoint_data)
-            
-            if st:
-                st.write(f"✅ Chunk {i:03d}: {dur_sec:.1f}s")
-
-        except Exception as e:
-            failed_count += 1
-            if st:
-                st.error(f"❌ Errore chunk {i}: {e}")
-                st.warning(f"💾 **Progresso salvato**: {i-1} chunk completati. Riavvia per continuare.")
-            
-            # Salva checkpoint anche in caso di errore
-            checkpoint_data = {
-                "audio_completed": i - 1,
-                "total_chunks": len(chunks),
-                "last_updated": time.time(),
-                "voice_id": voice_id
-            }
-            save_checkpoint(base_dir, checkpoint_data)
-            continue
-
-    # Cleanup progress
-    if progress_bar:
-        progress_bar.progress(1.0)
-        if status_text:
-            completed_new = len(audio_paths) - completed_count
-            status_text.write(f"✅ Completati {completed_new} nuovi chunk ({len(audio_paths)} totali)")
-        time.sleep(1)
-        progress_bar.empty()
-        if status_text:
-            status_text.empty()
-
-    if failed_count > 0 and st:
-        st.warning(f"⚠️ {failed_count} chunk falliti")
-
-    if not audio_paths:
-        return None
-
-    # Concatenazione (solo se necessaria)
-    final_audio_path = os.path.join(os.path.dirname(outdir), "combined_audio.mp3")
-    
-    # Se esiste già l'audio finale e abbiamo tutti i chunk, non riconcatenare
-    if os.path.exists(final_audio_path) and len(audio_paths) == len(chunks):
-        if st:
-            final_duration = mp3_duration_seconds(final_audio_path)
-            st.success(f"🔊 Audio finale esistente: {final_duration:.1f}s ({final_duration/60:.1f} min)")
-        
-        # Se completato tutto, rimuovi checkpoint
-        clear_checkpoint(base_dir)
-        return final_audio_path
-
-    # Concatenazione necessaria
-    if st:
-        st.write(f"🔗 Concatenando {len(audio_paths)} file...")
-
-    try:
-        concat_mp3s(audio_paths, final_audio_path)
-        
-        final_duration = mp3_duration_seconds(final_audio_path)
-        total_time = time.time() - start_time
-        
-        if st:
-            st.success(f"🔊 Audio finale: {final_duration:.1f}s ({final_duration/60:.1f} min)")
-            if completed_count == 0:  # Solo se generato tutto in questa sessione
-                st.info(f"⏱️ Tempo questa sessione: {total_time/60:.1f} min")
-
-        # Se completato tutto, rimuovi checkpoint
-        if len(audio_paths) >= len(chunks):
-            clear_checkpoint(base_dir)
-            if st:
-                st.success(f"🎉 **Tutti i {len(chunks)} chunk completati!** Checkpoint rimosso.")
-
-        return final_audio_path
-        
-    except Exception as e:
-        if st:
-            st.error(f"❌ Errore concatenazione: {e}")
-        raise
-
-# ============== Helper Functions ==============
-
-def _st():
-    """Helper per importare Streamlit solo se disponibile"""
-    try:
-        import streamlit as st
-        return st
-    except Exception:
-        return None
-
-# ============== Chunking Functions ==============
-
-def chunk_text(text: str, max_chars: int):
-    """Chunking base per caratteri"""
-    words = (text or "").split()
-    parts, curr, length = [], [], 0
-    for w in words:
-        add = len(w) + (1 if curr else 0)
-        if length + add > max_chars and curr:
-            parts.append(" ".join(curr))
-            curr, length = [], 0
-        curr.append(w)
-        length += add
-    if curr:
-        parts.append(" ".join(curr))
-    return parts
-
-def chunk_by_sentence(text: str, max_chars: int):
-    """Chunking per frasi con limite caratteri"""
-    sentences = re.split(r'(?<=[.?!])\s+', (text or "").strip())
-    parts, curr = [], ""
-    for sent in sentences:
-        candidate = (curr + " " + sent).strip() if curr else sent.strip()
-        if len(candidate) <= max_chars:
-            curr = candidate
-        else:
-            if curr:
-                parts.append(curr)
-            curr = sent.strip()
-    if curr:
-        parts.append(curr)
-    return parts
-
-def chunk_by_sentences_count(text: str, sentences_per_chunk: int):
-    """Chunking per numero di frasi"""
-    sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', (text or "").strip()) if s.strip()]
-    N = max(1, int(sentences_per_chunk or 1))
-    return [" ".join(sentences[i:i + N]) for i in range(0, len(sentences), N)]
-
-def chunk_text_for_audio(text: str, target_chars: int = 2000, max_chars: int = 4000):
-    """
-    Chunking specifico per audio - gestisce script lunghi
-    """
-    if not text:
-        return []
-    
-    original_length = len(text)
-    if original_length <= target_chars:
-        return [text]
-    
-    # Dividi per frasi (supporta . ? ! ;)
-    sentences = re.split(r'(?<=[.?!;])\s+', text.strip())
-    
-    chunks = []
-    current_chunk = ""
-    
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-            
-        # Test se aggiungendo questa frase supero il target
-        test_chunk = (current_chunk + " " + sentence).strip() if current_chunk else sentence
-        
-        if len(test_chunk) <= target_chars:
-            current_chunk = test_chunk
-        else:
-            # Se la frase è troppo lunga, spezzala intelligentemente
-            if len(sentence) > max_chars:
-                # Salva chunk corrente se non vuoto
-                if current_chunk:
-                    chunks.append(current_chunk)
-                    current_chunk = ""
-                
-                # Spezza la frase lunga per parole
-                words = sentence.split()
-                temp_chunk = ""
-                for word in words:
-                    test_word = (temp_chunk + " " + word).strip() if temp_chunk else word
-                    if len(test_word) <= max_chars:
-                        temp_chunk = test_word
-                    else:
-                        if temp_chunk:
-                            chunks.append(temp_chunk)
-                        if len(word) > max_chars:
-                            # Spezza parole troppo lunghe
-                            for j in range(0, len(word), max_chars):
-                                chunks.append(word[j:j + max_chars])
-                            temp_chunk = ""
-                        else:
-                            temp_chunk = word
-                
-                if temp_chunk:
-                    current_chunk = temp_chunk
-            else:
-                # Salva chunk corrente e inizia nuovo
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = sentence
-    
-    # Aggiungi ultimo chunk
-    if current_chunk:
-        chunks.append(current_chunk)
-    
-    return chunks
-
-# ============== Image Generation ==============
-
-def save_image_from_url(url: str, path: str, timeout: int = 60):
-    """Scarica e salva immagine da URL"""
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    img = Image.open(BytesIO(r.content))
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if img.mode in ("P", "RGBA"):
-        img = img.convert("RGB")
-    img.save(path)
-
-def _download_first(urls, dest_path: str):
-    """Scarica la prima URL disponibile"""
-    if not urls:
-        raise ValueError("Nessuna URL immagine restituita dal modello.")
-    save_image_from_url(urls[0], dest_path)
-    return dest_path
-
-def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float = None):
-    """
-    Genera immagini usando Replicate
-    """
-    st = _st()
-    os.makedirs(outdir, exist_ok=True)
-
-    # Estrai configurazione
-    api_key = (cfg or {}).get("replicate_api_token") or (cfg or {}).get("replicate_api_key") or os.getenv("REPLICATE_API_TOKEN")
-    model = (cfg or {}).get("image_model") or (cfg or {}).get("replicate_model")
-    extra_input = (cfg or {}).get("replicate_input", {})
-    
-    # Sleep dinamico
-    if sleep_between_calls is None:
-        sleep_between_calls = cfg.get("sleep_time", 11.0)
-
-    if not api_key:
-        msg = "Replicate API token assente."
-        if st: st.error("❌ " + msg)
-        raise ValueError(msg)
-    if not model:
-        msg = "Modello Replicate assente."
-        if st: st.error("❌ " + msg)
-        raise ValueError(msg)
-
-    # Normalizza nome modello
     if ":" not in model:
         model = f"{model}:latest"
         if st:
             st.info(f"🔧 Aggiunto tag :latest → `{model}`")
 
-    # Inizializza client Replicate
     import replicate
     client = replicate.Client(api_token=api_key)
-
-    # Info debug
-    masked = (api_key[:3] + "…" + api_key[-4:]) if len(api_key) > 8 else "—"
-    if st:
-        st.write(f"🔐 Token: {masked} | 🧩 Modello: `{model}`")
 
     results = []
-    failed_chunks = []
-    start_time = time.time()
+    failed = []
+    t0 = time.time()
 
-    # Progress bar per molte immagini
-    if st and len(chunks) > 5:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-    else:
-        progress_bar = None
-        status_text = None
-    
-    for idx, prompt in enumerate(chunks, start=1):
-        # Aggiorna progress bar
+    progress_bar = st.progress(0) if st and len(chunks) > 5 else None
+    status_text = st.empty() if progress_bar else None
+
+    for i, prompt in enumerate(chunks, start=1):
         if progress_bar and status_text:
-            progress = (idx - 1) / len(chunks)
-            progress_bar.progress(progress)
-            elapsed = time.time() - start_time
-            if idx > 1:
-                avg_time = elapsed / (idx - 1)
-                eta = avg_time * (len(chunks) - idx + 1)
-                status_text.write(f"🎨 Generando immagine {idx}/{len(chunks)} - ETA: {eta/60:.1f} min")
-            else:
-                status_text.write(f"🎨 Generando immagine {idx}/{len(chunks)}...")
+            progress_bar.progress((i - 1) / len(chunks))
+            if i > 1:
+                avg = (time.time() - t0) / (i - 1)
+                eta = avg * (len(chunks) - i + 1)
+                status_text.write(f"🎨 {i}/{len(chunks)} · ETA {eta/60:.1f} min")
         elif st:
-            st.write(f"🎨 Generando immagine {idx}/{len(chunks)}...")
+            st.write(f"🎨 Immagine {i}/{len(chunks)}…")
 
-        model_input = {"prompt": prompt}
-        model_input.setdefault("aspect_ratio", (cfg or {}).get("aspect_ratio", "16:9"))
+        inp = {"prompt": prompt}
+        inp.setdefault("aspect_ratio", (cfg or {}).get("aspect_ratio", "16:9"))
         if isinstance(extra_input, dict):
-            model_input.update(extra_input)
+            inp.update(extra_input)
 
         try:
-            output = client.run(model, input=model_input)
-            
-            # Estrai URLs
+            output = client.run(model, input=inp)
             urls = []
             if isinstance(output, str):
                 urls = [output]
@@ -893,111 +240,153 @@ def generate_images(chunks, cfg: dict, outdir: str, sleep_between_calls: float =
                     if isinstance(v, list) and v:
                         urls = v; break
 
-            outpath = os.path.join(outdir, f"img_{idx:03d}.png")
+            outpath = os.path.join(outdir, f"img_{i:03d}.png")
             _download_first(urls, outpath)
             results.append(outpath)
 
-            # Successo
             if st:
-                elapsed = time.time() - start_time
-                st.write(f"✅ Immagine {idx} generata: `{os.path.basename(outpath)}` (tempo: {elapsed/60:.1f} min)")
+                st.write(f"✅ Immagine {i}: `{os.path.basename(outpath)}`")
 
         except Exception as e:
-            failed_chunks.append(idx)
+            failed.append(i)
             if st:
-                st.error(f"❌ Errore immagine {idx}: {e}")
+                st.error(f"❌ Errore immagine {i}: {e}")
 
-        # Sleep tra chiamate
-        if sleep_between_calls > 0 and idx < len(chunks):
+        if sleep_between_calls and i < len(chunks):
             time.sleep(sleep_between_calls)
 
-    # Cleanup progress bar
     if progress_bar:
         progress_bar.progress(1.0)
         if status_text:
-            status_text.write(f"✅ Completate {len(results)} immagini")
-        time.sleep(1)
-        progress_bar.empty()
-        if status_text:
-            status_text.empty()
+            status_text.write(f"✅ {len(results)} immagini completate")
+        time.sleep(0.5)
+        progress_bar.empty(); status_text.empty()
 
-    # Report finale
-    if failed_chunks and st:
-        st.warning(f"⚠️ {len(failed_chunks)} immagini fallite su {len(chunks)} totali")
-    
+    if failed and st:
+        st.warning(f"⚠️ {len(failed)} fallite su {len(chunks)}")
+
     if not results:
         raise RuntimeError("Nessuna immagine generata con successo.")
-
     return results
 
-# ============== Audio Generation ==============
+# ==================== AUDIO helpers =====================
 
 def mp3_duration_seconds(path: str) -> float:
-    """Ritorna la durata in secondi usando mutagen"""
     try:
         from mutagen.mp3 import MP3
         return float(MP3(path).info.length)
     except Exception:
         return 0.0
 
-def concat_mp3s(paths, out_path: str, bitrate_kbps: int = 128):
-    """Concatena MP3 usando ffmpeg con fallback"""
-    if not paths:
-        raise RuntimeError("Nessun file MP3 da concatenare.")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    # Prova ffmpeg
-    ffmpeg_bin = None
-    
+def _ffmpeg_exe() -> Optional[str]:
     try:
         import imageio_ffmpeg
-        ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
-        import shutil
-        ffmpeg_bin = shutil.which("ffmpeg")
-    
-    if not ffmpeg_bin:
-        return _concat_mp3s_alternative(paths, out_path)
+        return shutil.which("ffmpeg")
 
-    list_path = out_path + ".txt"
-    with open(list_path, "w", encoding="utf-8") as f:
-        for p in paths:
-            abspath = os.path.abspath(p)
-            f.write(f"file '{abspath}'\n")
-
-    cmd = [
-        ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-        "-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k", out_path,
-    ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode()[:200]}")
-    
+def _make_silence_wav(path: str, secs: float) -> bool:
+    ff = _ffmpeg_exe()
+    if not ff: return False
     try:
-        os.remove(list_path)
+        r = subprocess.run([
+            ff, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", str(secs), "-c:a", "pcm_s16le", path
+        ], capture_output=True, text=True)
+        return r.returncode == 0 and os.path.exists(path)
+    except Exception:
+        return False
+
+def _to_wav_with_tail(in_path: str, out_path: str, tail_secs: float = TAIL_SILENCE_SECS) -> bool:
+    """
+    Converte qualsiasi input in WAV 44.1kHz, aggiungendo tail di silenzio.
+    """
+    ff = _ffmpeg_exe()
+    if not ff:  # niente ffmpeg → semplice copia in WAV possibile? no → falla in MP3 diretto
+        return False
+    tmp_dir = os.path.dirname(out_path)
+    os.makedirs(tmp_dir, exist_ok=True)
+    sil = os.path.join(tmp_dir, "_tail.wav")
+    if not _make_silence_wav(sil, tail_secs):
+        # solo transcodifica a WAV
+        r = subprocess.run([
+            ff, "-y", "-hide_banner", "-loglevel", "error",
+            "-i", in_path, "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out_path
+        ], capture_output=True, text=True)
+        return r.returncode == 0 and os.path.exists(out_path)
+
+    r = subprocess.run([
+        ff, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", in_path, "-i", sil,
+        "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[a]",
+        "-map", "[a]", "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le", out_path
+    ], capture_output=True, text=True)
+    try:
+        os.remove(sil)
+    except Exception:
+        pass
+    return r.returncode == 0 and os.path.exists(out_path)
+
+def concat_mp3s(paths: List[str], out_path: str, bitrate_kbps: int = 192, between_silence: float = BETWEEN_SILENCE_SECS):
+    """
+    Concat robusto: decodifica a PCM, inserisce silenzio tra clip, ricodifica in MP3.
+    Evita il demuxer MP3 (padding/delay).
+    """
+    if not paths:
+        raise RuntimeError("Nessun file audio da concatenare.")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    ff = _ffmpeg_exe()
+    if not ff:
+        raise RuntimeError("ffmpeg non trovato")
+
+    tmp = out_path + ".__tmp"
+    os.makedirs(tmp, exist_ok=True)
+
+    # converti tutto a WAV con tail
+    wavs = []
+    for i, p in enumerate(paths):
+        w = os.path.join(tmp, f"p_{i:03d}.wav")
+        if not _to_wav_with_tail(p, w, TAIL_SILENCE_SECS):
+            raise RuntimeError(f"ffmpeg fallito su {p}")
+        wavs.append(w)
+
+    # silenzio tra parti
+    sil = os.path.join(tmp, "_between.wav")
+    if between_silence > 0 and not _make_silence_wav(sil, between_silence):
+        sil = None
+
+    # costruisci cmd: [p1,(sil),p2,(sil),...,pn]
+    cmd = [ff, "-y", "-hide_banner", "-loglevel", "error"]
+    nin = 0
+    for i, w in enumerate(wavs):
+        cmd += ["-i", w]; nin += 1
+        if sil and i < len(wavs) - 1:
+            cmd += ["-i", sil]; nin += 1
+
+    labels = "".join([f"[{i}:a]" for i in range(nin)])
+    filt = f"{labels}concat=n={nin}:v=0:a=1[a]"
+    cmd += [
+        "-filter_complex", filt, "-map", "[a]",
+        "-ar", "44100", "-ac", "2",
+        "-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k",
+        out_path
+    ]
+
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    # cleanup
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
     except Exception:
         pass
 
-def _concat_mp3s_alternative(paths, out_path: str):
-    """Fallback concatenazione senza ffmpeg"""
-    with open(out_path, 'wb') as outfile:
-        for i, path in enumerate(paths):
-            with open(path, 'rb') as infile:
-                if i == 0:
-                    outfile.write(infile.read())
-                else:
-                    data = infile.read()
-                    # Cerca sync frame MP3
-                    for j in range(min(1000, len(data) - 1)):
-                        if data[j] == 0xFF and (data[j+1] & 0xE0) == 0xE0:
-                            outfile.write(data[j:])
-                            break
-                    else:
-                        outfile.write(data)
-    return out_path
+    if r.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError(f"ffmpeg concat fallito: {r.stderr[:200]}")
+
+# ==================== AUDIO (FishAudio) ==================
 
 def _download_with_retry(url: str, retries: int = 5, timeout: int = 60) -> bytes:
-    """Download con retry"""
     last_exc = None
     for attempt in range(retries):
         try:
@@ -1010,74 +399,97 @@ def _download_with_retry(url: str, retries: int = 5, timeout: int = 60) -> bytes
                 time.sleep(1.5 * (attempt + 1))
     raise last_exc or RuntimeError("Download fallito")
 
-def generate_audio(chunks, cfg: dict, outdir: str, tts_endpoint: str = "https://api.fish.audio/v1/tts"):
+def _resolve_voice_id(cfg: dict) -> str:
+    """Prende voice id da cfg o ENV (molte chiavi comuni), fallback a DEFAULT."""
+    # cfg keys
+    for k in [
+        "fishaudio_voice_id", "fishaudio_voice", "fishaudio_speaker",
+        "voice_model_id", "voice_id", "voice", "speaker", "speaker_id"
+    ]:
+        v = (cfg or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # env keys
+    for k in [
+        "FISHAUDIO_VOICE_ID", "FISHAUDIO_VOICE", "FISHAUDIO_SPEAKER",
+        "VOICE_MODEL_ID", "VOICE_ID", "VOICE", "SPEAKER", "SPEAKER_ID"
+    ]:
+        v = os.getenv(k)
+        if v and v.strip():
+            return v.strip()
+    return DEFAULT_FISHAUDIO_VOICE_ID
+
+def generate_audio(
+    chunks: List[str],
+    cfg: dict,
+    outdir: str,
+    tts_endpoint: str = "https://api.fish.audio/v1/tts",
+    progress_cb=None,
+):
     """
-    Genera audio usando FishAudio TTS
+    Genera audio usando FishAudio TTS.
+    - Normalizza i testi (punteggiatura + spazio finale).
+    - Forza voice_id se non presente in cfg (fallback alla voce di default).
+    - Salva MP3; se ffmpeg disponibile, crea anche WAV con tail di silenzio.
+    - Se più chunk, concat finale robusto (PCM) con silenzio tra clip.
     """
     st = _st()
     os.makedirs(outdir, exist_ok=True)
-    
-    # Estrai configurazione
-    api_key = (cfg or {}).get("fishaudio_api_key")
-    voice_id = (cfg or {}).get("fishaudio_voice") or (cfg or {}).get("fishaudio_voice_id")
-    model = (cfg or {}).get("fishaudio_model")
-    extra = (cfg or {}).get("fishaudio_extra", {})
 
+    # Config
+    api_key = (cfg or {}).get("fishaudio_api_key") or os.getenv("FISHAUDIO_API_KEY")
     if not api_key:
         msg = "FishAudio API key assente."
         if st: st.error("❌ " + msg)
         raise ValueError(msg)
-    if not voice_id:
-        msg = "FishAudio Voice ID assente."
-        if st: st.error("❌ " + msg)
-        raise ValueError(msg)
 
-    # Info chunking
-    total_chars = sum(len(chunk) for chunk in chunks)
-    avg_chars = total_chars / len(chunks) if chunks else 0
-    
+    voice_id = _resolve_voice_id(cfg)
+    model = (cfg or {}).get("fishaudio_model") or os.getenv("FISHAUDIO_MODEL") or None
+    extra = (cfg or {}).get("fishaudio_extra", {})
+
+    # Debug voce
     if st:
-        st.info(f"📊 Audio: {len(chunks)} segmenti | {total_chars:,} caratteri | Media: {avg_chars:.0f}")
+        st.caption(f"🎙️ Voice ID in uso: `{voice_id}`")
+
+    # Normalize chunk texts
+    norm_chunks = [_normalize_trailing_for_tts(c) for c in (chunks or []) if (c or "").strip()]
+    if not norm_chunks:
+        return None
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    # il sito mostra spesso un header "model: speech-1.5"
     if model:
         headers["model"] = model
-
-    audio_paths = []
-    failed_count = 0
-    start_time = time.time()
-
-    # Progress bar per molti chunk
-    if st and len(chunks) > 10:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
     else:
-        progress_bar = None
-        status_text = None
+        # usa un default ragionevole se non specificato
+        headers["model"] = "speech-1.5"
 
-    for i, text in enumerate(chunks, 1):
-        # Aggiorna progress
-        if progress_bar and status_text:
-            progress = i / len(chunks)
-            progress_bar.progress(progress)
-            elapsed = time.time() - start_time
+    audio_paths: List[str] = []
+    t0 = time.time()
+    pb = st.progress(0.0) if st and len(norm_chunks) > 5 else None
+    stat = st.empty() if pb else None
+
+    for i, text in enumerate(norm_chunks, start=1):
+        if pb and stat:
+            pb.progress((i - 1) / len(norm_chunks))
             if i > 1:
-                avg_time = elapsed / (i - 1)
-                eta = avg_time * (len(chunks) - i)
-                status_text.write(f"🎧 Audio {i}/{len(chunks)} - ETA: {eta/60:.1f} min")
-            else:
-                status_text.write(f"🎧 Audio {i}/{len(chunks)}...")
+                avg = (time.time() - t0) / (i - 1)
+                eta = avg * (len(norm_chunks) - i + 1)
+                stat.write(f"🎧 {i}/{len(norm_chunks)} · ETA {eta/60:.1f} min")
         elif st:
-            st.write(f"🎧 Generando audio {i}/{len(chunks)} ({len(text)} caratteri)...")
+            st.write(f"🎧 Generando audio {i}/{len(norm_chunks)}… ({len(text)} char)")
 
         payload = {
             "text": text,
-            "reference_id": voice_id,
+            "reference_id": voice_id,   # chiave corretta per FishAudio
             "format": "mp3",
-            "mp3_bitrate": 128,
+            "mp3_bitrate": 192,
+            # Flag “sicuri” spesso supportati (ignorati se non previsti):
+            "normalize": True,
+            "trim_silence": False,
         }
         if model:
             payload["model"] = model
@@ -1086,80 +498,76 @@ def generate_audio(chunks, cfg: dict, outdir: str, tts_endpoint: str = "https://
 
         try:
             resp = requests.post(tts_endpoint, headers=headers, json=payload, timeout=180)
-            
             if resp.status_code >= 400:
-                failed_count += 1
-                if st:
-                    st.error(f"❌ HTTP {resp.status_code} chunk {i}")
+                if st: st.error(f"❌ HTTP {resp.status_code} al chunk {i}: {resp.text[:200]}")
                 continue
 
-            # Processa risposta
             ct = resp.headers.get("Content-Type", "")
             if "application/json" in ct:
                 data = resp.json()
                 audio_url = data.get("audio_url") or data.get("url")
                 audio_b64 = data.get("audio_base64") or data.get("audio")
-                
                 if audio_url:
                     audio_bytes = _download_with_retry(audio_url)
                 elif audio_b64:
                     audio_bytes = base64.b64decode(audio_b64)
                 else:
-                    failed_count += 1
+                    if st: st.error(f"❌ Nessun audio nella risposta (chunk {i})")
                     continue
             else:
                 audio_bytes = resp.content
 
-            # Salva file
-            path = os.path.join(outdir, f"audio_{i:03d}.mp3")
-            with open(path, "wb") as f:
+            # Salva MP3
+            mp3_path = os.path.join(outdir, f"audio_{i:03d}.mp3")
+            with open(mp3_path, "wb") as f:
                 f.write(audio_bytes)
+            audio_paths.append(mp3_path)
 
-            dur_sec = mp3_duration_seconds(path)
-            audio_paths.append(path)
-            
+            # se posso, creo subito un WAV con tail di silenzio (anti-taglio per uso stand-alone)
+            ff = _ffmpeg_exe()
+            if ff:
+                wav_fixed = os.path.join(outdir, f"audio_{i:03d}.wav")
+                if _to_wav_with_tail(mp3_path, wav_fixed, TAIL_SILENCE_SECS):
+                    # teniamo entrambe le versioni; il chiamante sceglie cosa usare
+                    pass
+
+            if progress_cb:
+                try:
+                    progress_cb(f"Chunk {i:03d} ok")
+                except Exception:
+                    pass
+
             if st:
-                st.write(f"✅ Chunk {i:03d}: {dur_sec:.1f}s")
+                dur = mp3_duration_seconds(mp3_path)
+                st.write(f"✅ Chunk {i:03d} ({dur:.1f}s)")
 
         except Exception as e:
-            failed_count += 1
             if st:
                 st.error(f"❌ Errore chunk {i}: {e}")
+            continue
 
-    # Cleanup progress
-    if progress_bar:
-        progress_bar.progress(1.0)
-        if status_text:
-            status_text.write(f"✅ Completati {len(audio_paths)} chunk")
-        time.sleep(1)
-        progress_bar.empty()
-        if status_text:
-            status_text.empty()
-
-    if failed_count > 0 and st:
-        st.warning(f"⚠️ {failed_count} chunk falliti")
+    if pb:
+        pb.progress(1.0); time.sleep(0.2); pb.empty()
+        if stat: stat.empty()
 
     if not audio_paths:
         return None
 
-    # Concatenazione
-    if st:
-        st.write(f"🔗 Concatenando {len(audio_paths)} file...")
-
-    try:
+    # Se più chunk: concat robusto (PCM + silenzio) → outdir/combined_audio.mp3
+    if len(audio_paths) > 1:
         out_path = os.path.join(outdir, "combined_audio.mp3")
-        concat_mp3s(audio_paths, out_path)
-        
-        final_duration = mp3_duration_seconds(out_path)
-        total_time = time.time() - start_time
-        
-        if st:
-            st.success(f"🔊 Audio finale: {final_duration:.1f}s ({final_duration/60:.1f} min)")
-            st.info(f"⏱️ Tempo totale: {total_time/60:.1f} min")
+        try:
+            concat_mp3s(audio_paths, out_path, bitrate_kbps=192, between_silence=BETWEEN_SILENCE_SECS)
+            if st:
+                final_dur = mp3_duration_seconds(out_path)
+                st.success(f"🔊 Audio finale: {final_dur:.1f}s")
+            return out_path
+        except Exception as e:
+            if st:
+                st.error(f"❌ Errore concatenazione: {e}")
+            # ritorna comunque lista delle clip
+            return audio_paths
 
-        return out_path
-        
-    except Exception as e:
-        if st:
-            st.error(f"❌ Errore concatenazione: {e}")
-        raise
+    # Un solo chunk → ritorna il file prodotto
+    return audio_paths[0]
+

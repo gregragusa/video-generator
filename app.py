@@ -4,8 +4,9 @@
 # ✅ Resume reale e robusto per AUDIO/IMMAGINI con checkpoint atomici
 # ✅ Pulsanti "Continua da chunk N" + Auto-Restore con "Genera contenuti"
 # ✅ Combine audio affidabile anche con formati misti (mp3/wav/m4a)
-# ✅ Nessuna dipendenza da vecchie funzioni di checkpoint esterne
-# ✅ (MOD) Chunk audio ~1000 char a fine frase + pausa tra chunk (~0.8s)
+# ✅ Nessuna dipendenza da funzioni di checkpoint esterne
+# ✅ MOD: Chunk audio ~1000 char a fine frase + pausa tra chunk (~0.8s)
+# ✅ MOD: Cambio Voice ID forza rigenerazione e viene propagato via env
 # -------------------------------------------------------
 
 import os
@@ -26,7 +27,7 @@ except Exception:  # pragma: no cover
 # utils base (richiesti)
 from scripts.utils import (  # type: ignore
     chunk_by_sentences_count,
-    chunk_text_for_audio,
+    chunk_text_for_audio,   # lasciata per compat ma non usata nello split custom
     generate_audio,
     generate_images,
     mp3_duration_seconds,
@@ -39,12 +40,15 @@ AUDIO_EXTS = ("mp3", "wav", "m4a")
 IMAGE_EXTS = ("png", "jpg", "jpeg")
 STATE_FILENAME = "state.json"  # checkpoint unificato per questo progetto
 GEN_TIMEOUT_SECS = 10 * 60
-SILENCE_BETWEEN_PARTS_SECS = 0.8  # ✨ pausa tra un chunk audio e il successivo (0.5–1.0s ok)
+SILENCE_BETWEEN_PARTS_SECS = 0.8  # pausa tra un chunk audio e il successivo (0.5–1.0s ok)
 
 
 def sanitize(title: str) -> str:
     s = (title or "").lower()
-    for a, b in [(" ", "_"), ("ù", "u"), ("à", "a"), ("è", "e"), ("ì", "i"), ("ò", "o"), ("é", "e")]:
+    for a, b in [
+        (" ", "_"), ("ù", "u"), ("à", "a"), ("è", "e"),
+        ("ì", "i"), ("ò", "o"), ("é", "e"),
+    ]:
         s = s.replace(a, b)
     return "".join(ch for ch in s if ch.isalnum() or ch == "_") or "video"
 
@@ -54,7 +58,7 @@ def sha1(text: str) -> str:
 
 
 # -------------------------------------------------------
-# Stato/Checkpoint (atomico, senza dipendere da utils vecchi)
+# Stato/Checkpoint (atomico)
 # -------------------------------------------------------
 class StateStore:
     def __init__(self, base_dir: str):
@@ -91,7 +95,6 @@ class StateStore:
 # -------------------------------------------------------
 # Lock anti-stallo
 # -------------------------------------------------------
-
 def _lock_path(base_dir: str) -> str:
     return os.path.join(base_dir, ".generation.lock")
 
@@ -140,7 +143,6 @@ def clear_lock(base_dir: str):
 # -------------------------------------------------------
 # File helpers
 # -------------------------------------------------------
-
 def ensure_empty_dir(path: str):
     os.makedirs(path, exist_ok=True)
     for n in os.listdir(path):
@@ -156,12 +158,9 @@ def move_single_output(src_dir: str, dst_fullpath_no_ext: str, preferred_exts) -
     files = [n for n in os.listdir(src_dir) if not n.startswith(".")]
     if not files:
         return None
-    # nella cartella temporanea ci deve essere un solo file di output
     files.sort(key=lambda n: os.path.getmtime(os.path.join(src_dir, n)))
-    src = os.path.join(src_dir, files[-1])  # prendi il PIÙ recente
+    src = os.path.join(src_dir, files[-1])
     ext = files[-1].split(".")[-1].lower()
-    if ext not in preferred_exts:
-        pass  # salviamo col suo ext; eventuale transcodifica avverrà nel combine
     dst = f"{dst_fullpath_no_ext}.{ext}"
     try:
         os.replace(src, dst)
@@ -172,7 +171,6 @@ def move_single_output(src_dir: str, dst_fullpath_no_ext: str, preferred_exts) -
             os.remove(src)
         except Exception:
             pass
-    # pulizia residui
     for n in os.listdir(src_dir):
         try:
             os.remove(os.path.join(src_dir, n))
@@ -225,7 +223,6 @@ def zip_images(base_dir: str) -> str | None:
 # -------------------------------------------------------
 # CHUNK PERSISTENCE (determinismo)
 # -------------------------------------------------------
-
 def json_list_save(path: str, items: list):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -249,15 +246,14 @@ def json_list_load(path: str) -> list | None:
 # -------------------------------------------------------
 # SPLIT AUDIO: ~1000 caratteri, sempre a fine frase
 # -------------------------------------------------------
-
 def sentences_from_script(script: str) -> list:
-    # split robusto per . ? ! e spazi successivi
+    # split robusto per . ? ! seguiti da spazio/line-break
     return [s.strip() for s in re.split(r"(?<=[.?!])\s+", script.strip()) if s.strip()]
 
 
 def build_or_load_audio_chunks(base: str, script: str, chunk_size: int) -> list:
     """
-    (MOD) Split greedy per frasi con target ≈1000 char per chunk.
+    Split greedy per frasi con target ≈1000 char per chunk.
     - Non taglia MAI parole o frasi.
     - Se una singola frase supera i 1000, la teniamo intera (come richiesto).
     - Aggiunge un punto finale se il chunk non termina con .?!
@@ -289,13 +285,13 @@ def build_or_load_audio_chunks(base: str, script: str, chunk_size: int) -> list:
             continue
         candidate = (f"{buf} {s}".strip()) if buf else s
         if buf and len(candidate) > TARGET:
-            # chiudi buf a fine frase
             if buf[-1] not in ".?!":
                 buf += "."
             chunks.append(buf.strip())
-            buf = s  # nuova frase nel prossimo chunk
+            buf = s
         else:
             buf = candidate
+
     if buf:
         if buf[-1] not in ".?!":
             buf += "."
@@ -314,7 +310,6 @@ def build_or_load_audio_chunks(base: str, script: str, chunk_size: int) -> list:
 # -------------------------------------------------------
 # Combine Audio robusto (gestisce formati misti) + pausa tra parti
 # -------------------------------------------------------
-
 def list_audio_parts(aud_dir: str) -> list[str]:
     files = []
     for n in sorted(os.listdir(aud_dir)):
@@ -419,7 +414,6 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
             out_path,
         ], capture_output=True, text=True)
         if r.returncode == 0 and os.path.exists(out_path):
-            # cleanup
             for n in os.listdir(tmp_dir):
                 try:
                     os.remove(os.path.join(tmp_dir, n))
@@ -452,7 +446,7 @@ def combine_parts_to_mp3(aud_dir: str, out_path: str) -> bool:
 
 
 # -------------------------------------------------------
-# Timeline (uguale alla tua)
+# Timeline
 # -------------------------------------------------------
 class ProgressTracker:
     def __init__(self):
@@ -654,7 +648,10 @@ with st.sidebar:
         target_secs = st.number_input("Durata target chunk (s)", min_value=30, max_value=600, value=120, step=10, key="target_chunk_secs")
         cps_est = st.number_input("Parlato stimato (caratteri/s)", min_value=8.0, max_value=25.0, value=16.0, step=0.5, key="cps_est")
         st.session_state["chunk_size"] = int(target_secs * cps_est)
-        st.caption(f"Chunk stimato ≈ {st.session_state['chunk_size']} caratteri (~{st.session_state['chunk_size']/(cps_est*60):.1f} min)")
+        st.caption(
+            f"Chunk stimato ≈ {st.session_state['chunk_size']} caratteri "
+            f"(~{st.session_state['chunk_size']/(cps_est*60):.1f} min)"
+        )
 
     st.divider()
     st.header("🔄 Resume & Sblocco")
@@ -664,7 +661,7 @@ with st.sidebar:
             clear_lock(os.path.join("data", "outputs", sanitize(t)))
         st.session_state["is_generating"] = False
         st.success("Sbloccato. Puoi riprendere.")
-        st.experimental_rerun()
+        st.rerun()
     if st.button("🧹 Sblocca tutti i progetti"):
         base_root = "data/outputs"
         n = 0
@@ -679,10 +676,9 @@ with st.sidebar:
                         pass
         st.session_state["is_generating"] = False
         st.success(f"Sbloccati {n} progetti.")
-        st.experimental_rerun()
+        st.rerun()
 
-# Stato API
-
+# Stato API helpers
 def get_replicate_key() -> str:
     return (st.session_state.get("replicate_api_key") or os.environ.get("REPLICATE_API_TOKEN", "")).strip()
 
@@ -729,11 +725,12 @@ with col_main:
         sentences_per_image = st.number_input("Quante frasi per immagine?", min_value=1, value=2, step=1)
         st.session_state["sentences_per_image"] = sentences_per_image
 
+    # pulsante master
+    generate = st.button("🚀 Genera contenuti", use_container_width=True)
+
     # ----- Stato resume + pulsanti -----
     resume_audio_btn_clicked = False
     resume_images_btn_clicked = False
-
-    generate = st.button("🚀 Genera contenuti", use_container_width=True)
 
     if title.strip() and script.strip():
         safe = sanitize(title)
@@ -774,7 +771,7 @@ with col_main:
                     st.session_state["resume_start_image_idx"] = i_done
                     resume_images_btn_clicked = True
         else:
-            st.info(f"🖼️ Immagini: **{i_done}** create (totale sconosciuto finché non si pianifica)")
+            st.info("🖼️ Immagini: totale non ancora pianificato")
 
 with col_timeline:
     st.subheader("📊 Avanzamento")
@@ -848,6 +845,8 @@ if trigger_generate and title.strip() and script.strip():
     if model:
         runtime_cfg["replicate_model"] = model
     if voice:
+        # propagazione voice id sia via env che cfg
+        os.environ["FISHAUDIO_VOICE_ID"] = voice
         runtime_cfg["fishaudio_voice_id"] = voice
     runtime_cfg["chunk_size"] = get_chunk_size()
     runtime_cfg["sleep_time"] = get_sleep_time()
@@ -857,11 +856,29 @@ if trigger_generate and title.strip() and script.strip():
     st.session_state["title"] = title
     write_lock(base)
 
+    # ✅ Reset automatico se cambia Voice ID
+    prev_voice = state.get("voice_id")
+    if voice and prev_voice and voice != prev_voice:
+        try:
+            for n in os.listdir(aud_dir):
+                if n.startswith("part_") or n == "combined_audio.mp3":
+                    try:
+                        os.remove(os.path.join(aud_dir, n))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        state.update(audio_completed=0)
+        st.info(f"🔁 Voice ID cambiato: rigenero gli spezzoni audio con la nuova voce `{voice}`.")
+    state.update(voice_id=voice)
+
     tracker = ProgressTracker()
 
     # Chunk deterministici per AUDIO
     audio_chunks = (
-        build_or_load_audio_chunks(base, script, runtime_cfg["chunk_size"]) if effective_mode in ["Audio", "Entrambi"] else []
+        build_or_load_audio_chunks(base, script, runtime_cfg["chunk_size"])
+        if effective_mode in ["Audio", "Entrambi"]
+        else []
     )
 
     # Pianificazione immagini
@@ -935,7 +952,7 @@ if trigger_generate and title.strip() and script.strip():
                 try:
                     tracker.add_substep(step, f"🎵 Combinato: {mp3_duration_seconds(combined):.1f}s", "completed")
                 except Exception:
-                    tracker.add_substep(step, f"🎵 Combinato", "completed")
+                    tracker.add_substep(step, "🎵 Combinato", "completed")
             else:
                 tracker.add_substep(step, "ℹ️ ffmpeg non disponibile o combine fallito: restano i part_*.audio", "completed")
 
@@ -963,7 +980,7 @@ if trigger_generate and title.strip() and script.strip():
                     img_chunks_plan = [script]
                 else:
                     per_img = max(1, len(sents) // num_images)
-                    img_chunks_plan = [" ".join(sents[i: i + per_img]) for i in range(0, len(sents), per_img)]
+                    img_chunks_plan = [" ".join(sents[i:i + per_img]) for i in range(0, len(sents), per_img)]
                 json_list_save(os.path.join(base, "image_chunks.json"), img_chunks_plan)
             else:
                 if not img_chunks_plan:
